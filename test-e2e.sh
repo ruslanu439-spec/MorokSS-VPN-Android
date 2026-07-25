@@ -83,6 +83,22 @@ launch_app() {
     fi
 }
 
+dump_app_failure() {
+    info "  Recent app and Android runtime logs:"
+    "$ADB" logcat -d -v threadtime 2>/dev/null |
+        grep -E "AndroidRuntime|FATAL EXCEPTION|$PKG|com\.github\.shadowsocks" |
+        tail -n 250 || true
+    info "  Process exit history:"
+    "$ADB" shell dumpsys activity exit-info "$PKG" 2>/dev/null | tail -n 120 || true
+}
+
+ensure_app_running() {
+    if [[ -z "$("$ADB" shell pidof "$PKG" 2>/dev/null | tr -d '\r')" ]]; then
+        dump_app_failure
+        fail "$PKG stopped during startup"
+    fi
+}
+
 # ────────────────────────────────────────────────────────────────────────────
 # Step 1: Verify prerequisites
 # ────────────────────────────────────────────────────────────────────────────
@@ -142,9 +158,11 @@ info "Step 5: Configuring profile..."
 # ensureNotEmpty() creates a default profile (id=1) and sets profileId=1.
 # serviceMode defaults to "vpn".
 info "  Launching app to initialize databases..."
+"$ADB" logcat -c
 launch_app
 sleep 8
 screenshot "01_init"
+ensure_app_running
 # Force a checkpoint to flush WAL into main database file
 "$ADB" shell am force-stop "$PKG"
 sleep 2
@@ -161,6 +179,12 @@ info "  Updating default profile via sqlite3..."
 
 # Verify and checkpoint WAL into main DB
 file /tmp/profile.db
+if ! head -c 16 /tmp/profile.db | grep -a -q "SQLite format 3"; then
+    info "  App data files:"
+    "$ADB" shell "run-as $PKG sh -c 'pwd; find . -maxdepth 3 -type f -print'" 2>/dev/null || true
+    dump_app_failure
+    fail "profile.db is missing or invalid"
+fi
 sqlite3 /tmp/profile.db "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
 
 # Check tables
