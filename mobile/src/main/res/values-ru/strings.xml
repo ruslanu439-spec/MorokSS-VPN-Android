@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">MorokSS VPN</string>
     <string name="about_title">MorokSS VPN %s</string>
-    <string name="faq_url">https://github.com/ruslanu439-spec/MorokSS-VPN-Android/blob/main/MOROKSS.md</string>
+    <string name="faq_url">https://github.com/ruslanu439-spec/MorokSS-VPN-Android/blob/master/MOROKSS.md</string>
     <string name="action_paste_json">Вставить JSON MorokSS</string>
     <string name="morokss_json_hint">Вставь сюда весь JSON-конфиг</string>
 </resources>
