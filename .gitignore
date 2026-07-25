@@ -1,6 +1,7 @@
 # Gradle & Android Studio
 local.properties
 .gradle/
+.kotlin/
 .externalNativeBuild/
 build/
 captures/
@@ -11,4 +12,5 @@ release/
 
 # release apks
 *.apk
+core/src/main/jniLibs/
 .DS_Store

@@ -56,7 +56,12 @@ cargo {
     ))
     exec = { spec, toolchain ->
         run {
-            try {
+            if (System.getProperty("os.name").startsWith("Windows", ignoreCase = true)) {
+                // Windows Store aliases can return success without starting Python.
+                // The Python launcher resolves a real interpreter reliably.
+                spec.environment("RUST_ANDROID_GRADLE_PYTHON_COMMAND", "py")
+                project.logger.lifecycle("Windows Python launcher selected.")
+            } else try {
                 Runtime.getRuntime().exec(arrayOf("python3", "-V"))
                 spec.environment("RUST_ANDROID_GRADLE_PYTHON_COMMAND", "python3")
                 project.logger.lifecycle("Python 3 detected.")
@@ -103,8 +108,6 @@ dependencies {
     api(libs.androidx.work.multiprocess)
     api(libs.androidx.work.runtime.ktx)
     api(libs.dnsjava)
-    api(libs.firebase.analytics)
-    api(libs.firebase.crashlytics)
     api(libs.kotlinx.coroutines.android)
     api(libs.kotlinx.coroutines.play.services)
     api(libs.material)

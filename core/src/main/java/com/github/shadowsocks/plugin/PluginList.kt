@@ -28,6 +28,7 @@ import com.github.shadowsocks.Core.app
 class PluginList : ArrayList<Plugin>() {
     init {
         add(NoPlugin)
+        add(MorokssPlugin)
         addAll(app.packageManager.queryIntentContentProviders(
                 Intent(PluginContract.ACTION_NATIVE_PLUGIN), PackageManager.GET_META_DATA)
                 .filter { it.providerInfo.exported }.map { NativePlugin(it) })

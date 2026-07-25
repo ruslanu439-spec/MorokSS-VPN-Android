@@ -65,7 +65,10 @@ class ProxyInstance(val profile: Profile, private val route: String = profile.ro
 
     private var configFile: File? = null
     var trafficMonitor: TrafficMonitor? = null
-    val plugin by lazy { PluginManager.init(PluginConfiguration(profile.plugin ?: "")) }
+    private val morokss by lazy { MorokssTransport.from(profile) }
+    val plugin by lazy {
+        if (morokss == null) PluginManager.init(PluginConfiguration(profile.plugin ?: "")) else null
+    }
 
     /**
      * Sensitive shadowsocks configuration file requires extra protection. It may be stored in encrypted storage or
@@ -78,6 +81,17 @@ class ProxyInstance(val profile: Profile, private val route: String = profile.ro
         // init JSON config
         this.configFile = configFile
         val config = profile.toJson()
+        morokss?.also { transport ->
+            val nativeLibraryDir = (service as Context).applicationInfo.nativeLibraryDir
+            service.data.processes!!.start(
+                    transport.command(nativeLibraryDir, service.isVpnService, profile.id),
+                    mapOf("MOROKSS_SECRET" to transport.secret),
+            )
+            config.put("server", "127.0.0.1")
+            config.put("server_port", transport.localPort)
+            config.remove("plugin")
+            config.remove("plugin_opts")
+        }
         plugin?.let { (path, opts, isV2) ->
             if (service.isVpnService) {
                 if (isV2) opts["__android_vpn"] = "" else config.put("plugin_args", JSONArray(arrayOf("-V")))

@@ -1,23 +1,28 @@
-## [Shadowsocks](https://shadowsocks.org) for Android
+# MorokSS VPN для Android
 
-[![CircleCI](https://circleci.com/gh/shadowsocks/shadowsocks-android.svg?style=shield)](https://circleci.com/gh/shadowsocks/shadowsocks-android)
-[![API](https://img.shields.io/badge/API-23%2B-brightgreen.svg?style=flat)](https://android-arsenal.com/api?level=23)
-[![Releases](https://img.shields.io/github/downloads/shadowsocks/shadowsocks-android/total.svg)](https://github.com/shadowsocks/shadowsocks-android/releases)
-[![Language: Kotlin](https://img.shields.io/github/languages/top/shadowsocks/shadowsocks-android.svg)](https://github.com/shadowsocks/shadowsocks-android/search?l=kotlin)
-[![Codacy Badge](https://app.codacy.com/project/badge/Grade/22ca240f272445548e332a42d5a20d95)](https://www.codacy.com/gh/shadowsocks/shadowsocks-android/dashboard?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=shadowsocks/shadowsocks-android&amp;utm_campaign=Badge_Grade)
+[![Android build](https://github.com/ruslanu439-spec/MorokSS-VPN-Android/actions/workflows/android-build.yml/badge.svg)](https://github.com/ruslanu439-spec/MorokSS-VPN-Android/actions/workflows/android-build.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-orange.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-<a href="https://play.google.com/store/apps/details?id=com.github.shadowsocks"><img src="https://play.google.com/intl/en_us/badges/images/generic/en-play-badge.png" height="48"></a>
-for Android & Chrome OS ([beta](https://play.google.com/apps/testing/com.github.shadowsocks))  
-<a href="https://play.google.com/store/apps/details?id=com.github.shadowsocks.tv"><img src="https://play.google.com/intl/en_us/badges/images/generic/en-play-badge.png" height="48"></a>
-for Android TV ([beta](https://play.google.com/apps/testing/com.github.shadowsocks.tv))
+Это готовый Android VPN-клиент с профилями, QR, выбором приложений и поддержкой
+TCP/UDP. Внутрь добавлен наш транспорт MorokSS.
+
+Конфиг можно открыть файлом, импортировать из буфера или вставить прямо в окно
+«Вставить JSON MorokSS». Подробная инструкция лежит в [MOROKSS.md](MOROKSS.md).
+
+Но важно понимать ограничение: приложение не может гарантировать обход любой
+блокировки. Если заблокированы все IP из конфига, нужен новый endpoint.
+
+Основа проекта — официальный
+[Shadowsocks Android](https://github.com/shadowsocks/shadowsocks-android).
+Мы сохраняем его лицензию GPL-3.0 и историю изменений.
 
 
 ### PREREQUISITES
 
-* JDK 11+
+* JDK 17+
 * Android SDK
   - Android NDK
+* Go 1.24+
 * Rust with Android targets installed using `rustup target add armv7-linux-androideabi aarch64-linux-android i686-linux-android x86_64-linux-android`
 
 ### BUILD

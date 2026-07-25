@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MorokSS VPN</string>
+    <string name="about_title">MorokSS VPN %s</string>
+    <string name="faq_url">https://github.com/ruslanu439-spec/MorokSS-VPN-Android/blob/main/MOROKSS.md</string>
+    <string name="action_paste_json">Paste MorokSS JSON</string>
+    <string name="morokss_json_hint">Paste the whole JSON configuration here</string>
+</resources>

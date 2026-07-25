@@ -48,8 +48,8 @@ fun Project.setupCore() {
     setupCommon()
     android.apply {
         defaultConfig {
-            versionCode = 5030550
-            versionName = "5.3.5-nightly"
+            versionCode = 400000
+            versionName = "0.4.0-alpha1"
         }
         compileOptions.isCoreLibraryDesugaringEnabled = true
         lint.apply {
@@ -83,6 +83,7 @@ fun Project.setupApp() {
             getByName("debug") {
                 isPseudoLocalesEnabled = true
                 packagingOptions.doNotStrip("**/libsslocal.so")
+                packagingOptions.doNotStrip("**/libmorokss.so")
             }
             getByName("release") {
                 isShrinkResources = true

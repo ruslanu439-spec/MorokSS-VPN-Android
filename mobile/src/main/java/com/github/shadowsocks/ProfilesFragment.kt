@@ -27,15 +27,18 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.text.format.Formatter
+import android.text.InputType
 import android.util.LongSparseArray
 import android.view.LayoutInflater
 import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
+import android.widget.EditText
 import android.widget.TextView
 import androidx.activity.result.ActivityResultLauncher
 import androidx.appcompat.widget.PopupMenu
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.widget.SearchView
 import androidx.appcompat.widget.Toolbar
 import androidx.appcompat.widget.TooltipCompat
@@ -402,12 +405,8 @@ class ProfilesFragment : ToolbarFragment(), Toolbar.OnMenuItemClickListener, Sea
             }
             R.id.action_import_clipboard -> {
                 try {
-                    val profiles = Profile.findAllUrls(
-                            Core.clipboard.primaryClip!!.getItemAt(0).text,
-                            Core.currentProfile?.main
-                    ).toList()
-                    if (profiles.isNotEmpty()) {
-                        profiles.forEach { ProfileManager.createProfile(it) }
+                    val text = Core.clipboard.primaryClip!!.getItemAt(0).coerceToText(requireContext()).toString()
+                    if (importProfilesText(text)) {
                         (activity as MainActivity).snackbar().setText(R.string.action_import_msg).show()
                         return true
                     }
@@ -415,6 +414,10 @@ class ProfilesFragment : ToolbarFragment(), Toolbar.OnMenuItemClickListener, Sea
                     Timber.d(exc)
                 }
                 (activity as MainActivity).snackbar().setText(R.string.action_import_err).show()
+                true
+            }
+            R.id.action_paste_json -> {
+                showJsonInputDialog()
                 true
             }
             R.id.action_import_file -> {
@@ -443,6 +446,47 @@ class ProfilesFragment : ToolbarFragment(), Toolbar.OnMenuItemClickListener, Sea
             }
             else -> false
         }
+    }
+
+    private fun importProfilesText(text: String): Boolean {
+        val feature = Core.currentProfile?.main
+        val urls = Profile.findAllUrls(text, feature).toList()
+        if (urls.isNotEmpty()) {
+            urls.forEach(ProfileManager::createProfile)
+            return true
+        }
+        var imported = 0
+        Profile.parseJson(text, feature) {
+            imported++
+            ProfileManager.createProfile(it)
+        }
+        return imported > 0
+    }
+
+    private fun showJsonInputDialog() {
+        val input = EditText(requireContext()).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                    InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            minLines = 10
+            hint = getString(R.string.morokss_json_hint)
+            setPadding(48, 24, 48, 24)
+        }
+        AlertDialog.Builder(requireContext())
+                .setTitle(R.string.action_paste_json)
+                .setView(input)
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.action_import) { _, _ ->
+                    val activity = activity as MainActivity
+                    try {
+                        activity.snackbar().setText(if (importProfilesText(input.text.toString())) {
+                            R.string.action_import_msg
+                        } else R.string.action_import_err).show()
+                    } catch (e: Exception) {
+                        Timber.w(e)
+                        activity.snackbar(e.readableMessage).show()
+                    }
+                }
+                .show()
     }
 
     private fun startFilesForResult(launcher: ActivityResultLauncher<String>) {

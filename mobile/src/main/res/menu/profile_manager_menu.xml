@@ -15,6 +15,9 @@
                 android:alphabeticShortcut="v"
                 android:title="@string/action_import"/>
             <item
+                android:id="@+id/action_paste_json"
+                android:title="@string/action_paste_json"/>
+            <item
                 android:id="@+id/action_import_file"
                 android:alphabeticShortcut="o"
                 android:title="@string/action_import_file"/>

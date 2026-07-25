@@ -17,3 +17,6 @@
 [submodule "core/src/main/rust/shadowsocks-rust"]
 	path = core/src/main/rust/shadowsocks-rust
 	url = https://github.com/shadowsocks/shadowsocks-rust.git
+[submodule "third_party/morokss"]
+	path = third_party/morokss
+	url = https://github.com/ruslanu439-spec/MorokSS.git

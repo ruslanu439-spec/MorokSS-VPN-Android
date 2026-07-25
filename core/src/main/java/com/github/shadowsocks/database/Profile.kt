@@ -34,6 +34,7 @@ import androidx.room.Query
 import androidx.room.TypeConverter
 import androidx.room.Update
 import com.github.shadowsocks.plugin.PluginConfiguration
+import com.github.shadowsocks.plugin.MorokssPlugin
 import com.github.shadowsocks.plugin.PluginOptions
 import com.github.shadowsocks.preference.DataStore
 import com.github.shadowsocks.utils.Key
@@ -165,6 +166,30 @@ data class Profile(
         private class JsonParser(private val feature: Profile? = null) : ArrayList<Profile>() {
             val fallbackMap = mutableMapOf<Profile, Profile>()
 
+            private fun tryParseMorokss(json: JSONObject): Profile? {
+                val shadowsocks = json.optJSONObject("shadowsocks") ?: return null
+                val secret = json.optString("morokss_secret")
+                val hostname = json.optString("hostname")
+                val endpoint = json.optString("endpoint")
+                if (secret.isEmpty() || hostname.isEmpty() || endpoint.isEmpty()) return null
+                return tryParse(shadowsocks)?.apply {
+                    val options = PluginOptions(MorokssPlugin.ID, null)
+                    options["hostname"] = hostname
+                    options["secret"] = secret
+                    options["endpoint"] = endpoint
+                    json.optString("endpoint_ipv4").takeIf(String::isNotEmpty)?.let {
+                        options["endpoint_ipv4"] = it
+                    }
+                    json.optString("endpoint_ipv6").takeIf(String::isNotEmpty)?.let {
+                        options["endpoint_ipv6"] = it
+                    }
+                    options["profile"] = json.optString("profile", "auto")
+                    options["transport"] = json.optString("transport", "auto")
+                    plugin = options.toString(false)
+                    if (name.isNullOrEmpty()) name = "MorokSS"
+                }
+            }
+
             private fun tryParse(json: JSONObject, fallback: Boolean = false): Profile? {
                 val host = json.optString("server")
                 if (host.isNullOrEmpty()) return null
@@ -206,7 +231,7 @@ data class Profile(
             fun process(json: Any?) {
                 when (json) {
                     is JSONObject -> {
-                        val profile = tryParse(json)
+                        val profile = tryParseMorokss(json) ?: tryParse(json)
                         if (profile != null) add(profile) else json.keys().forEach { process(json.opt(it)) }
                     }
                     is JSONArray -> 0.until(json.length()).forEach { process(json.opt(it)) }

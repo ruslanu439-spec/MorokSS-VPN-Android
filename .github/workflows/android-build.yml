@@ -1,0 +1,40 @@
+name: Android build
+
+on:
+  push:
+    branches: [main, codex/morokss-transport]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  arm64-debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: jetbrains
+          java-version: 21
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: third_party/morokss/go.mod
+
+      - name: Build MorokSS transport
+        run: ./scripts/build-morokss.sh arm64-v8a
+
+      - name: Build APK
+        run: ./gradlew :mobile:assembleDebug -PCARGO_PROFILE=debug -PTARGET_ABI=arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MorokSS-VPN-arm64-debug
+          path: mobile/build/outputs/apk/debug/*arm64*.apk
