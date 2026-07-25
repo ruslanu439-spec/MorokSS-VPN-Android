@@ -1,0 +1,28 @@
+[Unit]
+Description=MorokSS transport for a local Shadowsocks backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=morokss
+Group=morokss
+WorkingDirectory=/opt/morokss
+EnvironmentFile=/etc/morokss.env
+ExecStart=/usr/bin/python3 -m morokss.server --listen ${SC_LISTEN} --backend ${SC_BACKEND} --decoy ${SC_DECOY} --cert ${SC_CERT} --key ${SC_KEY}
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            extension: ""
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            extension: ""
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            extension: ".exe"
+          - os: windows-latest
+            goos: windows
+            goarch: arm64
+            extension: ".exe"
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            extension: ""
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            extension: ""
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build client
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -trimpath -ldflags="-s -w" -o "dist/morokss-client-${GOOS}-${GOARCH}${{ matrix.extension }}" ./cmd/morokss-client
+
+      - name: Build manifest tool
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -trimpath -ldflags="-s -w" -o "dist/morokss-manifest-${GOOS}-${GOARCH}${{ matrix.extension }}" ./cmd/morokss-manifest
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+
+      - name: Restore Android signing key
+        env:
+          MOROKSS_ANDROID_KEYSTORE_BASE64: ${{ secrets.MOROKSS_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$MOROKSS_ANDROID_KEYSTORE_BASE64"
+          printf '%s' "$MOROKSS_ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/morokss-android-release.jks"
+
+      - name: Build native Android clients
+        run: ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.2.12479018" bash scripts/build-android.sh
+
+      - name: Build signed Android APK
+        env:
+          MOROKSS_ANDROID_KEYSTORE: ${{ runner.temp }}/morokss-android-release.jks
+          MOROKSS_ANDROID_STORE_PASSWORD: ${{ secrets.MOROKSS_ANDROID_STORE_PASSWORD }}
+          MOROKSS_ANDROID_KEY_ALIAS: morokss
+          MOROKSS_ANDROID_KEY_PASSWORD: ${{ secrets.MOROKSS_ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x android/gradlew
+          cd android
+          ./gradlew --no-daemon lintRelease assembleRelease
+          mkdir -p ../dist
+          cp app/build/outputs/apk/release/app-release.apk "../dist/MorokSS-Android-${GITHUB_REF_NAME}.apk"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries-android-universal
+          path: dist/MorokSS-Android-*.apk
+          if-no-files-found: error
+
+  publish:
+    needs: [binaries, android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binaries-*
+          path: release
+          merge-multiple: true
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Build Python package
+        run: |
+          python -m pip install build
+          python -m build
+          cp dist/* release/
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --generate-notes --verify-tag
