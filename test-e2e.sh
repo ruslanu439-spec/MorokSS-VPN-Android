@@ -16,6 +16,7 @@ AVD="${AVD:-Medium_Phone_API_36.1}"
 APK="${APK:-$SCRIPT_DIR/mobile/build/outputs/apk/debug/mobile-arm64-v8a-debug.apk}"
 SSSERVER="${SSSERVER:-$SCRIPT_DIR/core/src/main/rust/shadowsocks-rust/target/release/ssserver}"
 PKG="com.morokss.vpn"
+ACTIVITY="$PKG/com.github.shadowsocks.MainActivity"
 
 # ── SS config ───────────────────────────────────────────────────────────────
 SS_ADDR="0.0.0.0:8388"
@@ -68,6 +69,18 @@ screenshot() {
     "$ADB" shell screencap -p /sdcard/screen_${name}.png 2>/dev/null || true
     "$ADB" pull /sdcard/screen_${name}.png "$SCRIPT_DIR/screen_${name}.png" 2>/dev/null || true
     info "  Screenshot saved: screen_${name}.png"
+}
+
+launch_app() {
+    local output
+    if ! output=$("$ADB" shell am start -W -n "$ACTIVITY" 2>&1); then
+        echo "$output" >&2
+        fail "Could not launch $ACTIVITY"
+    fi
+    echo "$output"
+    if echo "$output" | grep -q "^Error:"; then
+        fail "Could not launch $ACTIVITY"
+    fi
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -129,7 +142,7 @@ info "Step 5: Configuring profile..."
 # ensureNotEmpty() creates a default profile (id=1) and sets profileId=1.
 # serviceMode defaults to "vpn".
 info "  Launching app to initialize databases..."
-"$ADB" shell am start -W -n "$PKG/.MainActivity"
+launch_app
 sleep 8
 screenshot "01_init"
 # Force a checkpoint to flush WAL into main database file
@@ -185,7 +198,7 @@ info "  Profile configuration done."
 info "Step 6: Enabling VPN..."
 
 # Launch the app
-"$ADB" shell am start -W -n "$PKG/.MainActivity"
+launch_app
 sleep 3
 screenshot "02_app_launched"
 
