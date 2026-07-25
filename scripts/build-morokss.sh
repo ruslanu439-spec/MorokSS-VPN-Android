@@ -21,7 +21,8 @@ esac
 
 output="$repo/core/src/main/jniLibs/$abi/libmorokss.so"
 mkdir -p "$(dirname "$output")"
-GOOS=android GOARCH="$goarch" CGO_ENABLED=1 CC="$toolchain/$cc" \
-  go build -buildmode=pie -trimpath -ldflags="-s -w" \
-  -o "$output" "$repo/third_party/morokss/cmd/morokss-client"
+(cd "$repo/third_party/morokss" && \
+  GOOS=android GOARCH="$goarch" CGO_ENABLED=1 CC="$toolchain/$cc" \
+    go build -buildmode=pie -trimpath -ldflags="-s -w" \
+    -o "$output" ./cmd/morokss-client)
 echo "Built $output"

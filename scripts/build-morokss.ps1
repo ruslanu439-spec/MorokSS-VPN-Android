@@ -34,8 +34,13 @@ try {
     $env:CGO_ENABLED = "1"
     $env:CC = Join-Path $toolchain $target.Cc
     if ($target.Arm) { $env:GOARM = $target.Arm } else { Remove-Item Env:GOARM -ErrorAction SilentlyContinue }
-    go build -buildmode=pie -trimpath -ldflags="-s -w" -o $output "$source\cmd\morokss-client"
-    if ($LASTEXITCODE -ne 0) { throw "MorokSS build failed with exit code $LASTEXITCODE" }
+    Push-Location $source
+    try {
+        go build -buildmode=pie -trimpath -ldflags="-s -w" -o $output ".\cmd\morokss-client"
+        if ($LASTEXITCODE -ne 0) { throw "MorokSS build failed with exit code $LASTEXITCODE" }
+    } finally {
+        Pop-Location
+    }
     Write-Host "Built $output"
 } finally {
     foreach ($name in $previous.Keys) {
