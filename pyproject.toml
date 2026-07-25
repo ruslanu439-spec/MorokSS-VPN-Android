@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "morokss"
+version = "0.2.2"
+description = "Экспериментальный адаптивный TLS-транспорт для Shadowsocks"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "ruslanu439-spec" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+]
+
+[project.optional-dependencies]
+dev = ["cryptography>=42"]
+
+[project.scripts]
+morokss-client-py = "morokss.client:main"
+morokss-server = "morokss.server:main"
+
+[tool.setuptools.packages.find]
+include = ["morokss*"]
