@@ -26,6 +26,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: third_party/morokss/go.mod
+          cache-dependency-path: third_party/morokss/go.sum
 
       - name: Enable KVM
         run: |
