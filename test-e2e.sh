@@ -15,7 +15,7 @@ ADB="${ADB:-/Volumes/Data/workspace/android/platform-tools/adb}"
 AVD="${AVD:-Medium_Phone_API_36.1}"
 APK="${APK:-$SCRIPT_DIR/mobile/build/outputs/apk/debug/mobile-arm64-v8a-debug.apk}"
 SSSERVER="${SSSERVER:-$SCRIPT_DIR/core/src/main/rust/shadowsocks-rust/target/release/ssserver}"
-PKG="com.github.shadowsocks"
+PKG="com.morokss.vpn"
 
 # ── SS config ───────────────────────────────────────────────────────────────
 SS_ADDR="0.0.0.0:8388"
