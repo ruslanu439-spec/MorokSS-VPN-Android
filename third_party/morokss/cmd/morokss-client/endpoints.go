@@ -108,6 +108,7 @@ type endpointPool struct {
 	failures          map[string]endpointFailure
 	profiles          map[string]*profileSelector
 	transports        map[string]*transportSelector
+	covers            map[string]*coverSelector
 	now               func() time.Time
 }
 
@@ -124,6 +125,7 @@ func newEndpointPool(items []endpoint, cachePath, profileMode, profileCachePath,
 		failures:   make(map[string]endpointFailure),
 		profiles:   make(map[string]*profileSelector),
 		transports: make(map[string]*transportSelector),
+		covers:     make(map[string]*coverSelector),
 		now:        time.Now,
 	}
 	entry := loadCachedEndpoint(cachePath, poolKey, items, time.Now())
@@ -136,6 +138,22 @@ func newEndpointPool(items []endpoint, cachePath, profileMode, profileCachePath,
 		pool.transports[item.key()] = newTransportSelector(transportMode, transportCachePath, selectorKey)
 	}
 	return pool
+}
+
+func (pool *endpointPool) configureCovers(mode string, candidates []string, cachePath, scope string) {
+	for _, item := range pool.endpoints {
+		key := coverEndpointKey(item.key(), scope)
+		pool.covers[item.key()] = newCoverSelector(mode, candidates, cachePath, key, item.Hostname)
+	}
+}
+
+func (pool *endpointPool) coverFor(item endpoint) *coverSelector {
+	selector := pool.covers[item.key()]
+	if selector == nil {
+		selector = newCoverSelector(coverModeOff, nil, "", item.key(), item.Hostname)
+		pool.covers[item.key()] = selector
+	}
+	return selector
 }
 
 func (pool *endpointPool) len() int {
@@ -231,7 +249,56 @@ func (pool *endpointPool) markSuccess(item endpoint) bool {
 type endpointOpener func(context.Context, clientConfig, *profileSelector, *transportSelector) (tunnelStream, error)
 
 func openAnyEndpoint(ctx context.Context, config clientConfig, pool *endpointPool) (tunnelStream, error) {
-	return openAnyEndpointWith(ctx, config, pool, openEndpointTunnel)
+	candidates, retryAfter := pool.candidates()
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("all endpoints are cooling down; retry after %s", retryAfter.Round(time.Second))
+	}
+	attemptErrors := make([]error, 0)
+	for endpointIndex, item := range candidates {
+		current := config
+		current.server = item.Address
+		current.hostname = item.Hostname
+		current.endpointIndex = pool.endpointIndex(item)
+		coverSelector := pool.coverFor(item)
+		covers, coverRetry := coverSelector.candidates()
+		if len(covers) == 0 {
+			attemptErrors = append(attemptErrors, fmt.Errorf("%s: all cover SNI candidates are cooling down for %s", item.Address, coverRetry.Round(time.Second)))
+			continue
+		}
+		for _, cover := range covers {
+			current.tlsSNI = cover
+			if coverSelector.needsProbe(cover) {
+				probeConfig := current
+				probeConfig.network = networkProbe
+				probeTunnel, err := openEndpointTunnel(ctx, probeConfig, pool.profileFor(item), pool.transportFor(item))
+				if err == nil {
+					err = probeDataPath(ctx, probeTunnel)
+					probeTunnel.close()
+				}
+				if err != nil {
+					coverSelector.markFailure(cover)
+					attemptErrors = append(attemptErrors, fmt.Errorf("%s with cover SNI %s: %w", item.Address, cover, err))
+					log.Printf("cover SNI %s failed the 96 KiB path probe; trying another", cover)
+					continue
+				}
+				if coverSelector.markSuccess(cover) {
+					log.Printf("cover SNI %s passed the 96 KiB path probe and was selected", cover)
+				}
+			}
+			tunnel, err := openEndpointTunnel(ctx, current, pool.profileFor(item), pool.transportFor(item))
+			if err == nil {
+				pool.markSuccess(item)
+				return tunnel, nil
+			}
+			coverSelector.markFailure(cover)
+			attemptErrors = append(attemptErrors, fmt.Errorf("%s with cover SNI %s: %w", item.Address, cover, err))
+		}
+		pool.markFailure(item)
+		if endpointIndex+1 < len(candidates) {
+			log.Printf("trying another endpoint")
+		}
+	}
+	return nil, fmt.Errorf("all available endpoints and cover SNI candidates failed: %w", errors.Join(attemptErrors...))
 }
 
 func openAnyEndpointWith(ctx context.Context, config clientConfig, pool *endpointPool, opener endpointOpener) (tunnelStream, error) {

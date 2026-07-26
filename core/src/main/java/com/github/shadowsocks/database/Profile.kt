@@ -185,6 +185,14 @@ data class Profile(
                     }
                     options["profile"] = json.optString("profile", "auto")
                     options["transport"] = json.optString("transport", "auto")
+                    json.optJSONArray("cover_sni")?.let { values ->
+                        val covers = (0 until values.length()).mapNotNull { index ->
+                            values.optString(index).trim().takeIf(String::isNotEmpty)
+                        }
+                        if (covers.isNotEmpty()) options["cover_sni"] = covers.joinToString(",")
+                    } ?: json.optString("cover_sni").takeIf(String::isNotEmpty)?.let {
+                        options["cover_sni"] = it
+                    }
                     plugin = options.toString(false)
                     if (name.isNullOrEmpty()) name = "MorokSS"
                 }

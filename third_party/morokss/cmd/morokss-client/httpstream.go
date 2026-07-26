@@ -31,9 +31,13 @@ func openHTTPStreamTunnel(_ context.Context, conn net.Conn, reader *bufio.Reader
 	if networkMode == "" {
 		networkMode = networkTCP
 	}
+	hostHeader := config.tlsSNI
+	if hostHeader == "" {
+		hostHeader = config.hostname
+	}
 	request := strings.Join([]string{
 		fmt.Sprintf("POST %s HTTP/1.1", path),
-		fmt.Sprintf("Host: %s", config.hostname),
+		fmt.Sprintf("Host: %s", hostHeader),
 		"Connection: keep-alive",
 		"Pragma: no-cache",
 		"Cache-Control: no-cache",

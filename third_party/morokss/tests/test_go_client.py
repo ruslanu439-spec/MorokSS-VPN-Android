@@ -285,7 +285,7 @@ class GoClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 report = json.loads(diagnose_output)
                 self.assertEqual(report["schema_version"], 1)
-                self.assertEqual(report["client_version"], "0.2.2")
+                self.assertEqual(report["client_version"], "0.3.0")
                 results = {item["network"]: item for item in report["results"]}
                 self.assertEqual(set(results), {"tcp", "udp"})
                 for result in results.values():

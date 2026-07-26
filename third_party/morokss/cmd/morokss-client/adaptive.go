@@ -23,6 +23,7 @@ const (
 	stageWebSocket  failureStage = "websocket"
 	stageHTTPStream failureStage = "http-stream"
 	stageAuth       failureStage = "auth"
+	stageProbe      failureStage = "path-probe"
 )
 
 type stagedError struct {

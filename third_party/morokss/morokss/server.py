@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
+import secrets
 import ssl
 from http import HTTPStatus
 
@@ -19,9 +21,37 @@ from .protocol import (
     relay_streams,
     secret_for_path,
     unpack_datagram,
+    unpack_envelope,
     verify_auth,
     websocket_accept,
 )
+
+PROBE_BYTES = 96 * 1024
+PROBE_CHUNK = 4 * 1024
+
+
+async def run_path_probe(tunnel: WebSocketStream | HTTPChunkStream) -> None:
+    """Verify that one connection carries well beyond the observed 16–20 KiB clamp."""
+    await tunnel.send_binary(pack_envelope(b""))
+    upload_hash = hashlib.sha256()
+    received = 0
+    while received < PROBE_BYTES:
+        data = unpack_envelope(await tunnel.receive_binary())
+        if not data or received + len(data) > PROBE_BYTES:
+            raise ProtocolError("invalid upload path probe")
+        upload_hash.update(data)
+        received += len(data)
+    await tunnel.send_binary(pack_envelope(b"up:" + upload_hash.digest()))
+
+    download_hash = hashlib.sha256()
+    remaining = PROBE_BYTES
+    while remaining:
+        chunk = secrets.token_bytes(min(PROBE_CHUNK, remaining))
+        download_hash.update(chunk)
+        await tunnel.send_binary(pack_envelope(chunk))
+        remaining -= len(chunk)
+    await tunnel.send_binary(pack_envelope(b"down:" + download_hash.digest()))
+    await tunnel.close()
 
 
 class UDPBackendProtocol(asyncio.DatagramProtocol):
@@ -189,7 +219,7 @@ async def handle_client(
             }
             and headers.get("content-type", "").lower()
             == "application/octet-stream"
-            and headers.get("x-stream-network", "") in {"tcp", "udp"}
+            and headers.get("x-stream-network", "") in {"tcp", "udp", "probe"}
         )
         if not websocket_request and not http_stream_request:
             await relay_plain_http(reader, writer, raw_head, decoy)
@@ -200,7 +230,10 @@ async def handle_client(
                 value.strip()
                 for value in headers.get("sec-websocket-protocol", "").split(",")
             }
-            if "morokss.udp.v1" in requested_protocols:
+            if "morokss.probe.v1" in requested_protocols:
+                selected_protocol = "morokss.probe.v1"
+                network_mode = "probe"
+            elif "morokss.udp.v1" in requested_protocols:
                 selected_protocol = "morokss.udp.v1"
                 network_mode = "udp"
             elif "morokss.v1" in requested_protocols:
@@ -243,6 +276,10 @@ async def handle_client(
 
         if network_mode == "udp":
             await relay_udp_backend(tunnel, backend, send_ready=ready_supported)
+            return
+
+        if network_mode == "probe":
+            await run_path_probe(tunnel)
             return
 
         backend_reader, backend_writer = await asyncio.wait_for(

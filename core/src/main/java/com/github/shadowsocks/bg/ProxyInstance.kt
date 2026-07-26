@@ -21,6 +21,8 @@
 package com.github.shadowsocks.bg
 
 import android.content.Context
+import android.net.NetworkCapabilities
+import com.github.shadowsocks.Core
 import android.util.Base64
 import com.github.shadowsocks.Core.app
 import com.github.shadowsocks.acl.Acl
@@ -84,7 +86,7 @@ class ProxyInstance(val profile: Profile, private val route: String = profile.ro
         morokss?.also { transport ->
             val nativeLibraryDir = (service as Context).applicationInfo.nativeLibraryDir
             service.data.processes!!.start(
-                    transport.command(nativeLibraryDir, service.isVpnService, profile.id),
+                    transport.command(nativeLibraryDir, service.isVpnService, profile.id, currentNetworkScope()),
                     mapOf("MOROKSS_SECRET" to transport.secret),
             )
             config.put("server", "127.0.0.1")
@@ -143,6 +145,21 @@ class ProxyInstance(val profile: Profile, private val route: String = profile.ro
         }
 
         service.data.processes!!.start(cmd)
+    }
+
+    private fun currentNetworkScope(): String {
+        val capabilities = Core.connectivity.allNetworks.asSequence()
+                .mapNotNull(Core.connectivity::getNetworkCapabilities)
+                .firstOrNull {
+                    !it.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                            it.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                } ?: return "unknown"
+        return when {
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+            else -> "other"
+        }
     }
 
     fun scheduleUpdate() {

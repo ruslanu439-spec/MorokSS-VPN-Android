@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -39,6 +40,11 @@ type clientConfig struct {
 	secret             []byte
 	insecure           bool
 	endpointIndex      int
+	tlsSNI             string
+	coverMode          string
+	coverSNIs          stringList
+	coverCachePath     string
+	networkScope       string
 	diagnostics        *diagnosticTrace
 }
 
@@ -63,6 +69,10 @@ func main() {
 	flag.StringVar(&config.manifestKeyPath, "manifest-public-key", "", "path to the Ed25519 public key for the endpoint manifest")
 	flag.StringVar(&config.manifestCachePath, "manifest-cache", defaultManifestCachePath(), "path to the last verified endpoint manifest; empty disables it")
 	flag.StringVar(&config.protectPath, "protect-path", "", "Android VpnService socket protection path")
+	flag.StringVar(&config.coverMode, "cover-sni-mode", coverModeAuto, "cover SNI selection: auto or off")
+	flag.Var(&config.coverSNIs, "cover-sni", "extra cover SNI candidate; may be repeated or comma-separated")
+	flag.StringVar(&config.coverCachePath, "cover-sni-cache", defaultCoverCachePath(), "path to the last-working cover SNI cache; empty disables it")
+	flag.StringVar(&config.networkScope, "network-scope", "default", "cache scope such as cellular or wifi")
 	flag.StringVar(&config.udpListen, "udp-listen", "", "optional local UDP listen address, usually the same address as --listen")
 	flag.DurationVar(&config.udpIdleTimeout, "udp-idle-timeout", 2*time.Minute, "idle timeout for a local UDP association")
 	flag.BoolVar(&diagnose, "diagnose", false, "test tunnel readiness and print a privacy-safe JSON report instead of starting local listeners")
@@ -74,6 +84,8 @@ func main() {
 	defer stop()
 	config.profile = strings.ToLower(strings.TrimSpace(config.profile))
 	config.transport = strings.ToLower(strings.TrimSpace(config.transport))
+	config.coverMode = strings.ToLower(strings.TrimSpace(config.coverMode))
+	config.networkScope = strings.ToLower(strings.TrimSpace(config.networkScope))
 	diagnoseNetwork = strings.ToLower(strings.TrimSpace(diagnoseNetwork))
 	config.network = networkTCP
 
@@ -128,6 +140,9 @@ func main() {
 	if !supportedTransport(config.transport) {
 		log.Fatalf("unsupported transport %q", config.transport)
 	}
+	if config.coverMode != coverModeAuto && config.coverMode != coverModeOff {
+		log.Fatalf("unsupported cover SNI mode %q", config.coverMode)
+	}
 	if config.udpListen != "" && config.udpIdleTimeout <= 0 {
 		log.Fatal("--udp-idle-timeout must be positive")
 	}
@@ -135,9 +150,11 @@ func main() {
 		log.Fatalf("unsupported --diagnose-network %q", diagnoseNetwork)
 	}
 	pool := newEndpointPool(endpoints, config.endpointCachePath, config.profile, config.cachePath, config.transport, config.transportCachePath, networkTCP)
+	pool.configureCovers(config.coverMode, config.coverSNIs, config.coverCachePath, config.networkScope+":"+networkTCP)
 	var udpPool *endpointPool
 	if config.udpListen != "" || (diagnose && diagnoseNetwork != networkTCP) {
 		udpPool = newEndpointPool(endpoints, config.endpointCachePath, config.profile, config.cachePath, config.transport, config.transportCachePath, networkUDP)
+		udpPool.configureCovers(config.coverMode, config.coverSNIs, config.coverCachePath, config.networkScope+":"+networkUDP)
 	}
 	if diagnose {
 		report, successful := runDiagnostics(ctx, config, pool, udpPool, diagnoseNetwork, diagnoseIncludeEndpoints)
@@ -242,9 +259,17 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 		return nil, atStage(stageTCP, fmt.Errorf("connect to server: %w", err))
 	}
 	profile, _ := clientHelloID(profileName)
-	tlsConfig := &utls.Config{
-		ServerName:         config.hostname,
-		InsecureSkipVerify: config.insecure,
+	tlsName := config.tlsSNI
+	if tlsName == "" {
+		tlsName = config.hostname
+	}
+	tlsConfig := &utls.Config{ServerName: tlsName, InsecureSkipVerify: config.insecure}
+	if !config.insecure && !strings.EqualFold(tlsName, config.hostname) {
+		tlsConfig.InsecureSkipVerify = true
+		realHostname := config.hostname
+		tlsConfig.VerifyConnection = func(state utls.ConnectionState) error {
+			return verifyConnectionHostname(state, realHostname)
+		}
 	}
 	tlsConn := utls.UClient(raw, tlsConfig, profile)
 	tlsConn.SetSessionCache(sessionCache)
@@ -278,15 +303,18 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 	protocolName := "morokss.v1"
 	if config.network == networkUDP {
 		protocolName = "morokss.udp.v1"
+	} else if config.network == networkProbe {
+		protocolName = "morokss.probe.v1"
 	}
+	hostHeader := tlsName
 	request := strings.Join([]string{
 		fmt.Sprintf("GET %s HTTP/1.1", path),
-		fmt.Sprintf("Host: %s", config.hostname),
+		fmt.Sprintf("Host: %s", hostHeader),
 		"Connection: Upgrade",
 		"Pragma: no-cache",
 		"Cache-Control: no-cache",
 		"Upgrade: websocket",
-		"Origin: https://" + config.hostname,
+		"Origin: https://" + hostHeader,
 		"Sec-WebSocket-Version: 13",
 		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
 		"Accept-Encoding: gzip, deflate, br, zstd",
@@ -347,6 +375,21 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 		}
 	}
 	return stream, nil
+}
+
+func verifyConnectionHostname(state utls.ConnectionState, hostname string) error {
+	if len(state.PeerCertificates) == 0 {
+		return errors.New("TLS server sent no certificate")
+	}
+	intermediates := x509.NewCertPool()
+	for _, certificate := range state.PeerCertificates[1:] {
+		intermediates.AddCert(certificate)
+	}
+	_, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{
+		DNSName:       hostname,
+		Intermediates: intermediates,
+	})
+	return err
 }
 
 func clientHelloID(profile string) (utls.ClientHelloID, error) {

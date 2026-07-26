@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	clientVersion = "0.2.2"
+	clientVersion = "0.3.0"
 	diagnosticAll = "all"
 )
 
@@ -217,6 +217,8 @@ func diagnosticErrorCode(err error) string {
 		return "http_stream_failed"
 	case stageAuth:
 		return "authentication_failed"
+	case stageProbe:
+		return "path_probe_failed"
 	default:
 		return "unavailable"
 	}

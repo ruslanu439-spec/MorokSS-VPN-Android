@@ -16,11 +16,13 @@ class MorokssTransportTest {
             put("endpoint", "edge.example.com:443")
             put("endpoint_ipv4", "203.0.113.10")
             put("endpoint_ipv6", "2001:db8::10")
+            put("cover_sni", "one.example.com, two.example.com,one.example.com")
         }
         val transport = MorokssTransport.from(Profile(plugin = options.toString(false)))!!
 
         assertEquals("auto", transport.tlsProfile)
         assertEquals("auto", transport.wireTransport)
+        assertEquals(listOf("one.example.com", "two.example.com"), transport.coverSnis)
         assertEquals(listOf(
                 "edge.example.com:443",
                 "203.0.113.10:443",

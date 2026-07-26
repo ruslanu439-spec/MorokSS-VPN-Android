@@ -13,6 +13,7 @@ data class MorokssTransport(
         val endpoints: List<String>,
         val tlsProfile: String,
         val wireTransport: String,
+        val coverSnis: List<String>,
 ) {
     companion object {
         fun from(profile: Profile): MorokssTransport? {
@@ -38,6 +39,8 @@ data class MorokssTransport(
                     endpoints,
                     options["profile"].orEmpty().ifBlank { "auto" },
                     options["transport"].orEmpty().ifBlank { "auto" },
+                    options["cover_sni"].orEmpty().split(',')
+                            .map(String::trim).filter(String::isNotEmpty).distinct(),
             )
         }
 
@@ -63,7 +66,7 @@ data class MorokssTransport(
 
     val localPort: Int by lazy { ServerSocket(0).use { it.localPort } }
 
-    fun command(nativeLibraryDir: String, isVpnService: Boolean, profileId: Long): List<String> = buildList {
+    fun command(nativeLibraryDir: String, isVpnService: Boolean, profileId: Long, networkScope: String): List<String> = buildList {
         val state = Core.deviceStorage.noBackupFilesDir
         add(File(nativeLibraryDir, Executable.MOROKSS).absolutePath)
         add("--listen")
@@ -80,6 +83,16 @@ data class MorokssTransport(
         add(File(state, "morokss-$profileId-transport.cache").absolutePath)
         add("--endpoint-cache")
         add(File(state, "morokss-$profileId-endpoint.cache").absolutePath)
+        add("--cover-sni-mode")
+        add("auto")
+        add("--cover-sni-cache")
+        add(File(state, "morokss-$profileId-cover-sni.cache").absolutePath)
+        add("--network-scope")
+        add(networkScope)
+        coverSnis.forEach {
+            add("--cover-sni")
+            add(it)
+        }
         endpoints.forEach {
             add("--endpoint")
             add("$it,$hostname")
