@@ -6,6 +6,8 @@ import contextlib
 import hashlib
 import secrets
 import ssl
+import time
+from collections import deque
 from http import HTTPStatus
 
 from .protocol import (
@@ -13,7 +15,7 @@ from .protocol import (
     HTTPChunkStream,
     ReplayCache,
     WebSocketStream,
-    load_secrets,
+    load_server_secrets,
     parse_endpoint,
     pack_datagram,
     pack_envelope,
@@ -28,6 +30,39 @@ from .protocol import (
 
 PROBE_BYTES = 96 * 1024
 PROBE_CHUNK = 4 * 1024
+
+
+class AdmissionControl:
+    def __init__(
+        self, max_active: int, max_per_minute: int, max_peer_records: int = 65536
+    ) -> None:
+        if max_active <= 0 or max_per_minute <= 0 or max_peer_records <= 0:
+            raise ValueError("connection limits must be positive")
+        self.max_active = max_active
+        self.max_per_minute = max_per_minute
+        self.max_peer_records = max_peer_records
+        self.active = 0
+        self.attempts: dict[str, deque[float]] = {}
+        self.lock = asyncio.Lock()
+
+    async def acquire(self, peer: str) -> bool:
+        now = time.monotonic()
+        async with self.lock:
+            if peer not in self.attempts and len(self.attempts) >= self.max_peer_records:
+                oldest = next(iter(self.attempts))
+                del self.attempts[oldest]
+            recent = self.attempts.setdefault(peer, deque())
+            while recent and recent[0] < now - 60:
+                recent.popleft()
+            if self.active >= self.max_active or len(recent) >= self.max_per_minute:
+                return False
+            recent.append(now)
+            self.active += 1
+            return True
+
+    async def release(self) -> None:
+        async with self.lock:
+            self.active = max(0, self.active - 1)
 
 
 async def run_path_probe(tunnel: WebSocketStream | HTTPChunkStream) -> None:
@@ -307,22 +342,36 @@ async def run(args: argparse.Namespace) -> None:
     listen = parse_endpoint(args.listen)
     backend = parse_endpoint(args.backend)
     decoy = parse_endpoint(args.decoy) if args.decoy else None
-    secrets = load_secrets()
+    secrets = load_server_secrets(args.secrets_file)
     replay_cache = ReplayCache()
+    admission = AdmissionControl(args.max_clients, args.max_connections_per_minute)
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.minimum_version = ssl.TLSVersion.TLSv1_2
     tls.load_cert_chain(args.cert, args.key)
     tls.set_alpn_protocols(["http/1.1"])
 
+    async def limited_client(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        peer_info = writer.get_extra_info("peername")
+        peer = str(peer_info[0]) if isinstance(peer_info, tuple) and peer_info else "unknown"
+        if not await admission.acquire(peer):
+            await reject(writer)
+            return
+        try:
+            await handle_client(
+                reader,
+                writer,
+                secret=secrets,
+                backend=backend,
+                decoy=decoy,
+                replay_cache=replay_cache,
+            )
+        finally:
+            await admission.release()
+
     server = await asyncio.start_server(
-        lambda reader, writer: handle_client(
-            reader,
-            writer,
-            secret=secrets,
-            backend=backend,
-            decoy=decoy,
-            replay_cache=replay_cache,
-        ),
+        limited_client,
         *listen,
         ssl=tls,
         limit=128 * 1024,
@@ -348,6 +397,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cert", required=True)
     parser.add_argument("--key", required=True)
+    parser.add_argument(
+        "--secrets-file",
+        help="optional JSON array of per-device client secrets",
+    )
+    parser.add_argument("--max-clients", type=int, default=1024)
+    parser.add_argument("--max-connections-per-minute", type=int, default=240)
     return parser
 
 

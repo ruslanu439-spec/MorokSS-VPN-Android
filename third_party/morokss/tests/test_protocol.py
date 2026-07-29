@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import datetime
 import ipaddress
+import json
 import pathlib
 import ssl
 import struct
@@ -19,6 +20,7 @@ from morokss.protocol import (
     accepted_paths,
     daily_path,
     load_secrets,
+    load_server_secrets,
     make_auth,
     pack_datagram,
     pack_envelope,
@@ -29,7 +31,7 @@ from morokss.protocol import (
     unpack_datagram,
     verify_auth,
 )
-from morokss.server import handle_client
+from morokss.server import AdmissionControl, handle_client
 
 try:
     from cryptography import x509
@@ -67,6 +69,14 @@ class ProtocolTests(unittest.TestCase):
             verify_auth(make_auth(SECRET, now - 1000), SECRET, ReplayCache(), now=now)
         )
 
+    def test_replay_cache_is_bounded(self) -> None:
+        cache = ReplayCache(ttl=120, max_entries=2)
+        self.assertTrue(cache.accept(b"a", now=100))
+        self.assertTrue(cache.accept(b"b", now=100))
+        self.assertTrue(cache.accept(b"c", now=100))
+        self.assertEqual(2, len(cache._seen))
+        self.assertNotIn(b"a", cache._seen)
+
     def test_secret_rotation_selects_matching_secret(self) -> None:
         previous = b"previous-secret-that-is-longer-than-thirty-two-bytes"
         now = 1_700_000_000
@@ -91,6 +101,16 @@ class ProtocolTests(unittest.TestCase):
         ):
             self.assertEqual(load_secrets(), (SECRET, previous.encode("ascii")))
 
+    def test_server_loads_per_device_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory, "secrets.json")
+            path.write_text(
+                json.dumps([SECRET.decode("ascii"), ROTATED_SECRET.decode("ascii")]),
+                encoding="utf-8",
+            )
+            with mock.patch.dict("os.environ", {}, clear=True):
+                self.assertEqual(load_server_secrets(str(path)), (SECRET, ROTATED_SECRET))
+
     def test_envelope_round_trip(self) -> None:
         for data in (b"", b"hello", b"x" * 8192):
             envelope = pack_envelope(data)
@@ -106,6 +126,17 @@ class ProtocolTests(unittest.TestCase):
             unpack_envelope(b"\x00")
         with self.assertRaises(ProtocolError):
             unpack_envelope(struct.pack("!H", 100) + b"short")
+
+
+class AdmissionControlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_limits_active_and_per_peer_connections(self) -> None:
+        control = AdmissionControl(max_active=1, max_per_minute=2)
+        self.assertTrue(await control.acquire("192.0.2.1"))
+        self.assertFalse(await control.acquire("192.0.2.2"))
+        await control.release()
+        self.assertTrue(await control.acquire("192.0.2.1"))
+        await control.release()
+        self.assertFalse(await control.acquire("192.0.2.1"))
 
 
 class WebSocketStreamTests(unittest.IsolatedAsyncioTestCase):

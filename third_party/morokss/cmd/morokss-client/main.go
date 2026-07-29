@@ -30,7 +30,7 @@ type clientConfig struct {
 	transport          string
 	transportCachePath string
 	endpointCachePath  string
-	manifestSource     string
+	manifestSources    manifestSourceList
 	manifestKeyPath    string
 	manifestCachePath  string
 	protectPath        string
@@ -65,7 +65,7 @@ func main() {
 	flag.StringVar(&config.transport, "transport", transportAuto, "transport: auto, websocket, or http-stream")
 	flag.StringVar(&config.transportCachePath, "transport-cache", defaultTransportCachePath(), "path to the last-working transport cache; empty disables it")
 	flag.StringVar(&config.endpointCachePath, "endpoint-cache", defaultEndpointCachePath(), "path to the last-working endpoint cache; empty disables it")
-	flag.StringVar(&config.manifestSource, "endpoint-manifest", "", "signed endpoint manifest as an HTTPS URL or local file")
+	flag.Var(&config.manifestSources, "endpoint-manifest", "signed endpoint manifest as an HTTPS URL or local file; may be repeated")
 	flag.StringVar(&config.manifestKeyPath, "manifest-public-key", "", "path to the Ed25519 public key for the endpoint manifest")
 	flag.StringVar(&config.manifestCachePath, "manifest-cache", defaultManifestCachePath(), "path to the last verified endpoint manifest; empty disables it")
 	flag.StringVar(&config.protectPath, "protect-path", "", "Android VpnService socket protection path")
@@ -105,13 +105,13 @@ func main() {
 		endpoints = append(endpoints, legacyEndpoint)
 	}
 	endpoints = append(endpoints, configuredEndpoints...)
-	if config.manifestSource != "" {
+	if len(config.manifestSources) != 0 {
 		if config.manifestKeyPath == "" {
 			log.Fatal("--manifest-public-key is required with --endpoint-manifest")
 		}
-		manifestEndpoints, cached, err := loadEndpointManifest(
+		manifestEndpoints, cached, err := loadEndpointManifestSources(
 			ctx,
-			config.manifestSource,
+			config.manifestSources,
 			config.manifestKeyPath,
 			config.manifestCachePath,
 			time.Now(),
@@ -208,7 +208,9 @@ func handleLocal(ctx context.Context, local net.Conn, config clientConfig, pool 
 		return err
 	}
 	defer tunnel.close()
-	return relay(local, tunnel)
+	err = relay(local, tunnel)
+	reportTunnelFailure(tunnel, err)
+	return err
 }
 
 type tunnelOpener func(context.Context, clientConfig, string) (tunnelStream, error)
@@ -237,7 +239,7 @@ func openTunnelWith(ctx context.Context, config clientConfig, selector *profileS
 			if selector.mode == "auto" && changed {
 				log.Printf("TLS profile %s is working and was selected", profile)
 			}
-			return tunnel, nil
+			return withTunnelSelection(tunnel, profile, ""), nil
 		}
 		lastError = err
 		stage, _ := errorStage(err)
@@ -422,11 +424,11 @@ func relay(local net.Conn, tunnel tunnelStream) error {
 			if read > 0 {
 				envelope, packErr := packEnvelope(buffer[:read], rand.Reader)
 				if packErr != nil {
-					errorsChannel <- packErr
+					errorsChannel <- atStage(stageTraffic, packErr)
 					return
 				}
 				if sendErr := tunnel.sendBinary(envelope); sendErr != nil {
-					errorsChannel <- sendErr
+					errorsChannel <- atStage(stageTraffic, sendErr)
 					return
 				}
 			}
@@ -440,12 +442,12 @@ func relay(local net.Conn, tunnel tunnelStream) error {
 		for {
 			payload, err := tunnel.receiveBinary()
 			if err != nil {
-				errorsChannel <- err
+				errorsChannel <- atStage(stageTraffic, err)
 				return
 			}
 			data, err := unpackEnvelope(payload)
 			if err != nil {
-				errorsChannel <- err
+				errorsChannel <- atStage(stageTraffic, err)
 				return
 			}
 			if err := writeAll(local, data); err != nil {

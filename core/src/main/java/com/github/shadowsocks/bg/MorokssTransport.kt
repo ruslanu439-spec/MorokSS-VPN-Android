@@ -14,6 +14,9 @@ data class MorokssTransport(
         val tlsProfile: String,
         val wireTransport: String,
         val coverSnis: List<String>,
+        val coverSniMode: String,
+        val manifestSources: List<String>,
+        val manifestPublicKey: String,
 ) {
     companion object {
         fun from(profile: Profile): MorokssTransport? {
@@ -33,14 +36,29 @@ data class MorokssTransport(
                     .mapNotNull { it?.trim()?.takeIf(String::isNotEmpty) }
                     .map { addPort(it, port) }
                     .distinct()
+            val coverSnis = options["cover_sni"].orEmpty().split(',')
+                    .map(String::trim).filter(String::isNotEmpty).distinct()
+            val coverSniMode = options["cover_sni_mode"].orEmpty()
+                    .ifBlank { if (coverSnis.isEmpty()) "off" else "auto" }
+            require(coverSniMode == "auto" || coverSniMode == "off") {
+                "MorokSS: cover_sni_mode must be auto or off"
+            }
+            val manifestSources = options["endpoint_manifest"].orEmpty()
+                    .split(',').map(String::trim).filter(String::isNotEmpty).distinct()
+            val manifestPublicKey = options["manifest_public_key"].orEmpty().trim()
+            require(manifestSources.isEmpty() == manifestPublicKey.isEmpty()) {
+                "MorokSS: endpoint_manifest and manifest_public_key must be set together"
+            }
             return MorokssTransport(
                     hostname,
                     secret,
                     endpoints,
                     options["profile"].orEmpty().ifBlank { "auto" },
                     options["transport"].orEmpty().ifBlank { "auto" },
-                    options["cover_sni"].orEmpty().split(',')
-                            .map(String::trim).filter(String::isNotEmpty).distinct(),
+                    coverSnis,
+                    coverSniMode,
+                    manifestSources,
+                    manifestPublicKey,
             )
         }
 
@@ -84,7 +102,7 @@ data class MorokssTransport(
         add("--endpoint-cache")
         add(File(state, "morokss-$profileId-endpoint.cache").absolutePath)
         add("--cover-sni-mode")
-        add("auto")
+        add(coverSniMode)
         add("--cover-sni-cache")
         add(File(state, "morokss-$profileId-cover-sni.cache").absolutePath)
         add("--network-scope")
@@ -92,6 +110,22 @@ data class MorokssTransport(
         coverSnis.forEach {
             add("--cover-sni")
             add(it)
+        }
+        if (manifestSources.isNotEmpty()) {
+            val publicKey = File(state, "morokss-$profileId-manifest-public.key")
+            publicKey.writeText(manifestPublicKey + "\n", Charsets.UTF_8)
+            publicKey.setReadable(false, false)
+            publicKey.setWritable(false, false)
+            publicKey.setReadable(true, true)
+            publicKey.setWritable(true, true)
+            manifestSources.forEach {
+                add("--endpoint-manifest")
+                add(it)
+            }
+            add("--manifest-public-key")
+            add(publicKey.absolutePath)
+            add("--manifest-cache")
+            add(File(state, "morokss-$profileId-manifest.cache").absolutePath)
         }
         endpoints.forEach {
             add("--endpoint")

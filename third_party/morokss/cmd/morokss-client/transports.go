@@ -26,6 +26,32 @@ type tunnelStream interface {
 	close()
 }
 
+type selectedTunnel struct {
+	tunnelStream
+	profile   string
+	transport string
+}
+
+func withTunnelSelection(tunnel tunnelStream, profile, transport string) tunnelStream {
+	if selected, ok := tunnel.(*selectedTunnel); ok {
+		if profile != "" {
+			selected.profile = profile
+		}
+		if transport != "" {
+			selected.transport = transport
+		}
+		return selected
+	}
+	return &selectedTunnel{tunnelStream: tunnel, profile: profile, transport: transport}
+}
+
+func tunnelSelection(tunnel tunnelStream) (string, string) {
+	if selected, ok := tunnel.(*selectedTunnel); ok {
+		return selected.profile, selected.transport
+	}
+	return "", ""
+}
+
 type transportFailure struct {
 	count      int
 	retryAfter time.Time
@@ -164,7 +190,7 @@ func openEndpointTunnelWith(ctx context.Context, config clientConfig, profileSel
 			if selector.markSuccess(transport) {
 				log.Printf("transport %s is working and was selected", transport)
 			}
-			return tunnel, nil
+			return withTunnelSelection(tunnel, "", transport), nil
 		}
 		lastError = err
 		if !retryableTransportFailure(err) {

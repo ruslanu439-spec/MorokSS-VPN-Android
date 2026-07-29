@@ -171,12 +171,19 @@ data class Profile(
                 val secret = json.optString("morokss_secret")
                 val hostname = json.optString("hostname")
                 val endpoint = json.optString("endpoint")
-                if (secret.isEmpty() || hostname.isEmpty() || endpoint.isEmpty()) return null
+                val endpointManifest = json.optJSONArray("endpoint_manifest")?.let { values ->
+                    (0 until values.length()).mapNotNull { index ->
+                        values.optString(index).trim().takeIf(String::isNotEmpty)
+                    }.joinToString(",")
+                } ?: json.optString("endpoint_manifest")
+                val manifestPublicKey = json.optString("manifest_public_key")
+                if (secret.isEmpty() || hostname.isEmpty() ||
+                        (endpoint.isEmpty() && endpointManifest.isEmpty())) return null
                 return tryParse(shadowsocks)?.apply {
                     val options = PluginOptions(MorokssPlugin.ID, null)
                     options["hostname"] = hostname
                     options["secret"] = secret
-                    options["endpoint"] = endpoint
+                    if (endpoint.isNotEmpty()) options["endpoint"] = endpoint
                     json.optString("endpoint_ipv4").takeIf(String::isNotEmpty)?.let {
                         options["endpoint_ipv4"] = it
                     }
@@ -185,6 +192,12 @@ data class Profile(
                     }
                     options["profile"] = json.optString("profile", "auto")
                     options["transport"] = json.optString("transport", "auto")
+                    options["cover_sni_mode"] = json.optString("cover_sni_mode",
+                            if (json.has("cover_sni")) "auto" else "off")
+                    if (endpointManifest.isNotEmpty()) {
+                        options["endpoint_manifest"] = endpointManifest
+                        options["manifest_public_key"] = manifestPublicKey
+                    }
                     json.optJSONArray("cover_sni")?.let { values ->
                         val covers = (0 until values.length()).mapNotNull { index ->
                             values.optString(index).trim().takeIf(String::isNotEmpty)

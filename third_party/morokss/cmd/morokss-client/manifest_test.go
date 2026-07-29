@@ -70,8 +70,72 @@ func TestEndpointManifestUsesVerifiedCache(t *testing.T) {
 	}
 }
 
+func TestEndpointManifestTriesMultipleSources(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	directory := t.TempDir()
+	manifestPath, publicKeyPath := writeTestManifest(t, directory, now)
+	items, cached, err := loadEndpointManifestSources(
+		context.Background(),
+		[]string{filepath.Join(directory, "missing.json"), manifestPath},
+		publicKeyPath,
+		filepath.Join(directory, "cache.json"),
+		now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached || len(items) != 1 || items[0].Hostname != "manifest.example" {
+		t.Fatalf("backup manifest source was not used: cached=%v items=%#v", cached, items)
+	}
+}
+
 func TestEndpointManifestRejectsHTTP(t *testing.T) {
 	if _, err := readManifestSource(context.Background(), "http://example.com/endpoints.json"); err == nil {
 		t.Fatal("plain HTTP manifest source was accepted")
+	}
+}
+
+func TestEndpointManifestRejectsRollback(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	directory := t.TempDir()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKeyPath := filepath.Join(directory, "public.key")
+	sourcePath := filepath.Join(directory, "source.json")
+	cachePath := filepath.Join(directory, "cache.json")
+	if err := os.WriteFile(publicKeyPath, endpointmanifest.EncodeKey(publicKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	write := func(path, hostname string, generatedAt time.Time) {
+		t.Helper()
+		document := endpointmanifest.Document{
+			Version: endpointmanifest.Version, GeneratedAt: generatedAt, ExpiresAt: now.Add(24 * time.Hour),
+			Endpoints: []endpointmanifest.Endpoint{{Address: "192.0.2.50:443", Hostname: hostname}},
+		}
+		if err := endpointmanifest.Sign(&document, privateKey); err != nil {
+			t.Fatal(err)
+		}
+		data, err := endpointmanifest.Encode(document)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write(sourcePath, "new.example", now)
+	if _, _, err := loadEndpointManifest(context.Background(), sourcePath, publicKeyPath, cachePath, now); err != nil {
+		t.Fatal(err)
+	}
+	write(sourcePath, "old.example", now.Add(-time.Hour))
+	items, cached, err := loadEndpointManifest(context.Background(), sourcePath, publicKeyPath, cachePath, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cached || len(items) != 1 || items[0].Hostname != "new.example" {
+		t.Fatalf("rollback replaced cached manifest: cached=%v items=%#v", cached, items)
 	}
 }

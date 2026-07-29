@@ -26,16 +26,6 @@ const (
 	probeChunk    = 4 * 1024
 )
 
-// These names are only TLS SNI candidates. The client still connects to the
-// configured MorokSS endpoint and verifies its real certificate hostname.
-var defaultCoverSNIs = []string{
-	"apple.com",
-	"github.com",
-	"amazon.com",
-	"ietf.org",
-	"bing.com",
-}
-
 type stringList []string
 
 func (values *stringList) String() string { return strings.Join(*values, ",") }
@@ -84,9 +74,6 @@ type coverSelector struct {
 func newCoverSelector(mode string, configured []string, cachePath, endpointKey, realHostname string) *coverSelector {
 	candidates := []string{strings.ToLower(strings.TrimSpace(realHostname))}
 	if mode == coverModeAuto {
-		if len(configured) == 0 {
-			configured = defaultCoverSNIs
-		}
 		candidates = append(candidates, configured...)
 	}
 	candidates = uniqueStrings(candidates)

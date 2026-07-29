@@ -3,10 +3,20 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+type probeTestTunnel struct {
+	transport string
+	profile   string
+}
+
+func (*probeTestTunnel) sendBinary([]byte) error        { return nil }
+func (*probeTestTunnel) receiveBinary() ([]byte, error) { return nil, io.EOF }
+func (*probeTestTunnel) close()                         {}
 
 func testEndpoints(t *testing.T) []endpoint {
 	t.Helper()
@@ -127,5 +137,68 @@ func TestOpenAnyEndpointFailsOver(t *testing.T) {
 	candidates, _ := pool.candidates()
 	if len(candidates) == 0 || candidates[0] != items[1] {
 		t.Fatalf("successful endpoint wasn't selected: %#v", candidates)
+	}
+}
+
+func TestPathProbeWalksTransportAndProfileMatrix(t *testing.T) {
+	profiles := newProfileSelector("auto", "", "server")
+	transports := newTransportSelector(transportAuto, "", "server")
+	attempts := make([]string, 0)
+	opener := func(_ context.Context, config clientConfig, profile string) (tunnelStream, error) {
+		attempts = append(attempts, config.transport+"/"+profile)
+		return &probeTestTunnel{transport: config.transport, profile: profile}, nil
+	}
+	probe := func(_ context.Context, tunnel tunnelStream) error {
+		selected := tunnel.(*probeTestTunnel)
+		if selected.transport == transportHTTPStream && selected.profile == "firefox" {
+			return nil
+		}
+		return atStage(stageProbe, errors.New("stream clamped"))
+	}
+
+	if err := probeEndpointPathWith(
+		context.Background(),
+		clientConfig{},
+		profiles,
+		transports,
+		opener,
+		probe,
+	); err != nil {
+		t.Fatal(err)
+	}
+	foundWebSocketFirefox := false
+	foundHTTPFirefox := false
+	for _, attempt := range attempts {
+		foundWebSocketFirefox = foundWebSocketFirefox || attempt == transportWebSocket+"/firefox"
+		foundHTTPFirefox = foundHTTPFirefox || attempt == transportHTTPStream+"/firefox"
+	}
+	if !foundWebSocketFirefox || !foundHTTPFirefox {
+		t.Fatalf("probe did not walk the matrix: %v", attempts)
+	}
+	transportCandidates, _ := transports.candidates()
+	profileCandidates, _ := profiles.candidates()
+	if transportCandidates[0] != transportHTTPStream || profileCandidates[0] != "firefox" {
+		t.Fatalf("working tuple was not selected: transport=%v profile=%v", transportCandidates, profileCandidates)
+	}
+}
+
+func TestTrafficFailureInvalidatesWholeTuple(t *testing.T) {
+	items := testEndpoints(t)
+	pool := newEndpointPool(items, "", "auto", "", transportAuto, "", networkTCP)
+	pool.configureCovers(coverModeOff, nil, "", networkTCP)
+	base := &probeTestTunnel{}
+	selected := withTunnelSelection(base, "chrome", transportWebSocket)
+	tracked := trackEndpointTunnel(selected, pool, items[0], items[0].Hostname)
+
+	reportTunnelFailure(tracked, atStage(stageTraffic, errors.New("connection reset")))
+
+	endpointCandidates, _ := pool.candidates()
+	transportCandidates, _ := pool.transportFor(items[0]).candidates()
+	profileCandidates, _ := pool.profileFor(items[0]).candidates()
+	if len(endpointCandidates) != 1 || endpointCandidates[0] != items[1] {
+		t.Fatalf("failed endpoint was not cooled down: %v", endpointCandidates)
+	}
+	if transportCandidates[0] == transportWebSocket || profileCandidates[0] == "chrome" {
+		t.Fatalf("failed tuple stayed preferred: transport=%v profile=%v", transportCandidates, profileCandidates)
 	}
 }
