@@ -16,7 +16,26 @@ import (
 	"github.com/ruslanu439-spec/MorokSS/internal/endpointmanifest"
 )
 
+type manifestSourceList []string
+
+func (sources *manifestSourceList) String() string {
+	return strings.Join(*sources, ",")
+}
+
+func (sources *manifestSourceList) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return errors.New("endpoint manifest source is empty")
+	}
+	*sources = append(*sources, value)
+	return nil
+}
+
 func loadEndpointManifest(ctx context.Context, source, publicKeyPath, cachePath string, now time.Time) ([]endpoint, bool, error) {
+	return loadEndpointManifestSources(ctx, []string{source}, publicKeyPath, cachePath, now)
+}
+
+func loadEndpointManifestSources(ctx context.Context, sources []string, publicKeyPath, cachePath string, now time.Time) ([]endpoint, bool, error) {
 	keyData, err := readSmallFile(publicKeyPath, 4*1024)
 	if err != nil {
 		return nil, false, fmt.Errorf("read endpoint manifest public key: %w", err)
@@ -26,27 +45,37 @@ func loadEndpointManifest(ctx context.Context, source, publicKeyPath, cachePath 
 		return nil, false, err
 	}
 
-	data, sourceErr := readManifestSource(ctx, source)
-	if sourceErr == nil {
-		document, verifyErr := endpointmanifest.Verify(data, publicKey, now)
-		if verifyErr == nil {
-			if err := saveManifestCache(cachePath, data); err != nil {
-				return nil, false, fmt.Errorf("save endpoint manifest cache: %w", err)
-			}
-			return convertManifestEndpoints(document.Endpoints), false, nil
-		}
-		sourceErr = verifyErr
-	}
-
+	var cachedDocument endpointmanifest.Document
 	cached, cacheErr := readSmallFile(cachePath, endpointmanifest.MaxDocument)
 	if cacheErr == nil {
-		document, verifyErr := endpointmanifest.Verify(cached, publicKey, now)
-		if verifyErr == nil {
-			return convertManifestEndpoints(document.Endpoints), true, nil
-		}
-		cacheErr = verifyErr
+		cachedDocument, cacheErr = endpointmanifest.Verify(cached, publicKey, now)
 	}
-	return nil, false, fmt.Errorf("load endpoint manifest: %w", errors.Join(sourceErr, cacheErr))
+
+	sourceErrors := make([]error, 0, len(sources))
+	for _, source := range sources {
+		data, sourceErr := readManifestSource(ctx, source)
+		if sourceErr == nil {
+			document, verifyErr := endpointmanifest.Verify(data, publicKey, now)
+			if verifyErr == nil {
+				if cacheErr == nil && document.GeneratedAt.Before(cachedDocument.GeneratedAt) {
+					sourceErr = errors.New("endpoint manifest rollback was rejected")
+				} else if err := saveManifestCache(cachePath, data); err != nil {
+					return nil, false, fmt.Errorf("save endpoint manifest cache: %w", err)
+				} else {
+					return convertManifestEndpoints(document.Endpoints), false, nil
+				}
+			} else {
+				sourceErr = verifyErr
+			}
+		}
+		sourceErrors = append(sourceErrors, fmt.Errorf("%s: %w", source, sourceErr))
+	}
+
+	if cacheErr == nil {
+		return convertManifestEndpoints(cachedDocument.Endpoints), true, nil
+	}
+	sourceErrors = append(sourceErrors, cacheErr)
+	return nil, false, fmt.Errorf("load endpoint manifest: %w", errors.Join(sourceErrors...))
 }
 
 func readManifestSource(ctx context.Context, source string) ([]byte, error) {

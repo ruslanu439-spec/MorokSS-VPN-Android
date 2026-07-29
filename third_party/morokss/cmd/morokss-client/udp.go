@@ -138,7 +138,7 @@ func (manager *udpAssociationManager) run(key string, association *udpAssociatio
 					err = tunnel.sendBinary(payload)
 				}
 				if err != nil {
-					errorsChannel <- err
+					errorsChannel <- atStage(stageTraffic, err)
 					return
 				}
 				lastActivity.Store(time.Now().UnixNano())
@@ -154,12 +154,12 @@ func (manager *udpAssociationManager) run(key string, association *udpAssociatio
 		for {
 			payload, err := tunnel.receiveBinary()
 			if err != nil {
-				errorsChannel <- err
+				errorsChannel <- atStage(stageTraffic, err)
 				return
 			}
 			data, err := unpackDatagram(payload)
 			if err != nil {
-				errorsChannel <- err
+				errorsChannel <- atStage(stageTraffic, err)
 				return
 			}
 			if _, err := manager.listener.WriteToUDP(data, association.address); err != nil {
@@ -178,6 +178,7 @@ func (manager *udpAssociationManager) run(key string, association *udpAssociatio
 	for {
 		select {
 		case err := <-errorsChannel:
+			reportTunnelFailure(tunnel, err)
 			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
 				log.Printf("UDP association %s closed: %v", association.address, err)
 			}

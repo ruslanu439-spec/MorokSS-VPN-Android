@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -247,6 +248,137 @@ func (pool *endpointPool) markSuccess(item endpoint) bool {
 }
 
 type endpointOpener func(context.Context, clientConfig, *profileSelector, *transportSelector) (tunnelStream, error)
+type pathProbeRunner func(context.Context, tunnelStream) error
+
+type endpointTunnel struct {
+	tunnelStream
+	pool    *endpointPool
+	item    endpoint
+	cover   string
+	profile string
+	wire    string
+	once    sync.Once
+}
+
+func trackEndpointTunnel(tunnel tunnelStream, pool *endpointPool, item endpoint, cover string) tunnelStream {
+	profile, wire := tunnelSelection(tunnel)
+	return &endpointTunnel{
+		tunnelStream: tunnel,
+		pool:         pool,
+		item:         item,
+		cover:        cover,
+		profile:      profile,
+		wire:         wire,
+	}
+}
+
+func (tunnel *endpointTunnel) reportFailure(err error) {
+	stage, staged := errorStage(err)
+	if !staged || stage != stageTraffic || errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+		return
+	}
+	tunnel.once.Do(func() {
+		tunnel.pool.markFailure(tunnel.item)
+		tunnel.pool.coverFor(tunnel.item).markFailure(tunnel.cover)
+		if tunnel.wire != "" {
+			tunnel.pool.transportFor(tunnel.item).markFailure(tunnel.wire)
+		}
+		if tunnel.profile != "" {
+			tunnel.pool.profileFor(tunnel.item).markTLSFailure(tunnel.profile)
+		}
+	})
+}
+
+func reportTunnelFailure(tunnel tunnelStream, err error) {
+	if reporter, ok := tunnel.(interface{ reportFailure(error) }); ok {
+		reporter.reportFailure(err)
+	}
+}
+
+func probeEndpointPath(
+	ctx context.Context,
+	config clientConfig,
+	profileSelector *profileSelector,
+	transportSelector *transportSelector,
+) error {
+	return probeEndpointPathWith(ctx, config, profileSelector, transportSelector, openTunnelWithProfile, probeDataPath)
+}
+
+func probeEndpointPathWith(
+	ctx context.Context,
+	config clientConfig,
+	profileSelector *profileSelector,
+	transportSelector *transportSelector,
+	opener tunnelOpener,
+	probe pathProbeRunner,
+) error {
+	transports, transportRetry := transportSelector.candidates()
+	if len(transports) == 0 {
+		return fmt.Errorf("all transports are cooling down; retry after %s", transportRetry.Round(time.Second))
+	}
+	profiles, profileRetry := profileSelector.candidates()
+	if len(profiles) == 0 {
+		return fmt.Errorf("all TLS profiles are cooling down; retry after %s", profileRetry.Round(time.Second))
+	}
+
+	attemptErrors := make([]error, 0, len(transports)*len(profiles))
+	failedProfiles := make(map[string]bool)
+	for _, transport := range transports {
+		transportRejected := false
+		for _, profile := range profiles {
+			if failedProfiles[profile] {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			current := config
+			current.transport = transport
+			attempt := -1
+			if current.diagnostics != nil {
+				attempt = current.diagnostics.startAttempt(
+					current.endpointIndex,
+					current.server,
+					current.hostname,
+					profile,
+					transport,
+				)
+			}
+			tunnel, err := opener(ctx, current, profile)
+			if err == nil {
+				err = probe(ctx, tunnel)
+				tunnel.close()
+			}
+			if current.diagnostics != nil {
+				current.diagnostics.finishAttempt(attempt, err)
+			}
+			if err == nil {
+				profileSelector.markSuccess(profile)
+				transportSelector.markSuccess(transport)
+				return nil
+			}
+			attemptErrors = append(attemptErrors, fmt.Errorf("%s/%s: %w", transport, profile, err))
+			stage, staged := errorStage(err)
+			switch {
+			case retryableTLSFailure(err):
+				profileSelector.markTLSFailure(profile)
+				failedProfiles[profile] = true
+			case staged && (stage == stageWebSocket || stage == stageHTTPStream):
+				transportSelector.markFailure(transport)
+				transportRejected = true
+			case staged && stage == stageProbe:
+				// A mid-stream clamp can depend on any part of the visible
+				// tuple. Keep walking the full transport/profile matrix.
+			default:
+				return err
+			}
+			if transportRejected {
+				break
+			}
+		}
+	}
+	return fmt.Errorf("all transport and TLS profile combinations failed the data-path probe: %w", errors.Join(attemptErrors...))
+}
 
 func openAnyEndpoint(ctx context.Context, config clientConfig, pool *endpointPool) (tunnelStream, error) {
 	candidates, retryAfter := pool.candidates()
@@ -270,11 +402,7 @@ func openAnyEndpoint(ctx context.Context, config clientConfig, pool *endpointPoo
 			if coverSelector.needsProbe(cover) {
 				probeConfig := current
 				probeConfig.network = networkProbe
-				probeTunnel, err := openEndpointTunnel(ctx, probeConfig, pool.profileFor(item), pool.transportFor(item))
-				if err == nil {
-					err = probeDataPath(ctx, probeTunnel)
-					probeTunnel.close()
-				}
+				err := probeEndpointPath(ctx, probeConfig, pool.profileFor(item), pool.transportFor(item))
 				if err != nil {
 					coverSelector.markFailure(cover)
 					attemptErrors = append(attemptErrors, fmt.Errorf("%s with cover SNI %s: %w", item.Address, cover, err))
@@ -288,7 +416,7 @@ func openAnyEndpoint(ctx context.Context, config clientConfig, pool *endpointPoo
 			tunnel, err := openEndpointTunnel(ctx, current, pool.profileFor(item), pool.transportFor(item))
 			if err == nil {
 				pool.markSuccess(item)
-				return tunnel, nil
+				return trackEndpointTunnel(tunnel, pool, item, cover), nil
 			}
 			coverSelector.markFailure(cover)
 			attemptErrors = append(attemptErrors, fmt.Errorf("%s with cover SNI %s: %w", item.Address, cover, err))

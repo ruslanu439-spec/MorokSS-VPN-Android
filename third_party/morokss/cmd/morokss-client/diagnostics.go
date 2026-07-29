@@ -219,6 +219,8 @@ func diagnosticErrorCode(err error) string {
 		return "authentication_failed"
 	case stageProbe:
 		return "path_probe_failed"
+	case stageTraffic:
+		return "traffic_failed"
 	default:
 		return "unavailable"
 	}

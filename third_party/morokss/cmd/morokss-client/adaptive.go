@@ -24,6 +24,7 @@ const (
 	stageHTTPStream failureStage = "http-stream"
 	stageAuth       failureStage = "auth"
 	stageProbe      failureStage = "path-probe"
+	stageTraffic    failureStage = "traffic"
 )
 
 type stagedError struct {

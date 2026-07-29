@@ -4,10 +4,12 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import struct
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -17,6 +19,7 @@ MAX_HTTP_HEADER = 16 * 1024
 MAX_WS_PAYLOAD = 64 * 1024
 DATA_CHUNK = 8 * 1024
 MAX_DATAGRAM = 65507
+WRITE_TIMEOUT = 15.0
 PADDING_BUCKETS = (256, 512, 1024, 2048, 4096, 8192, 12288)
 
 
@@ -54,6 +57,25 @@ def load_secrets() -> tuple[bytes, ...]:
     if hmac.compare_digest(current, previous):
         return (current,)
     return current, previous
+
+
+def load_server_secrets(path: str | None = None) -> tuple[bytes, ...]:
+    values: list[bytes] = []
+    if os.environ.get("MOROKSS_SECRET"):
+        values.extend(load_secrets())
+    if path:
+        with open(path, "r", encoding="utf-8") as source:
+            document = json.load(source)
+        if not isinstance(document, list):
+            raise ValueError("secrets file must contain a JSON array")
+        for item in document:
+            if not isinstance(item, str) or len(item.encode("utf-8")) < 32:
+                raise ValueError("each client secret must contain at least 32 UTF-8 bytes")
+            values.append(item.encode("utf-8"))
+    unique = tuple(dict.fromkeys(values))
+    if not unique:
+        raise ValueError("set MOROKSS_SECRET or use --secrets-file")
+    return unique
 
 
 def utc_day(timestamp: float | None = None) -> str:
@@ -101,14 +123,25 @@ def make_auth(secret: bytes, timestamp: int | None = None) -> bytes:
 @dataclass
 class ReplayCache:
     ttl: int = 120
-    _seen: dict[bytes, float] = field(default_factory=dict)
+    max_entries: int = 65536
+    _seen: OrderedDict[bytes, float] = field(default_factory=OrderedDict)
+
+    def __post_init__(self) -> None:
+        if self.ttl <= 0 or self.max_entries <= 0:
+            raise ValueError("replay cache limits must be positive")
 
     def accept(self, nonce: bytes, now: float | None = None) -> bool:
         current = time.time() if now is None else now
         cutoff = current - self.ttl
-        self._seen = {key: seen_at for key, seen_at in self._seen.items() if seen_at >= cutoff}
+        while self._seen:
+            _, seen_at = next(iter(self._seen.items()))
+            if seen_at >= cutoff:
+                break
+            self._seen.popitem(last=False)
         if nonce in self._seen:
             return False
+        while len(self._seen) >= self.max_entries:
+            self._seen.popitem(last=False)
         self._seen[nonce] = current
         return True
 
@@ -260,7 +293,7 @@ class WebSocketStream:
             self.writer.write(
                 encode_ws_frame(payload, masked=self.client_side, opcode=0x2)
             )
-            await self.writer.drain()
+            await asyncio.wait_for(self.writer.drain(), WRITE_TIMEOUT)
 
     async def receive_binary(self) -> bytes:
         while True:
@@ -278,7 +311,7 @@ class WebSocketStream:
                             payload, masked=self.client_side, opcode=0xA
                         )
                     )
-                    await self.writer.drain()
+                    await asyncio.wait_for(self.writer.drain(), WRITE_TIMEOUT)
                 continue
             if opcode == 0xA:
                 continue
@@ -295,8 +328,8 @@ class WebSocketStream:
                             opcode=0x8,
                         )
                     )
-                    await self.writer.drain()
-            except (ConnectionError, asyncio.CancelledError):
+                    await asyncio.wait_for(self.writer.drain(), WRITE_TIMEOUT)
+            except (ConnectionError, asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             self.writer.close()
             try:
@@ -320,7 +353,7 @@ class HTTPChunkStream:
             self.writer.write(f"{len(payload):x}\r\n".encode("ascii"))
             self.writer.write(payload)
             self.writer.write(b"\r\n")
-            await self.writer.drain()
+            await asyncio.wait_for(self.writer.drain(), WRITE_TIMEOUT)
 
     async def receive_binary(self) -> bytes:
         line = await self.reader.readline()
@@ -347,8 +380,8 @@ class HTTPChunkStream:
             try:
                 async with self._send_lock:
                     self.writer.write(b"0\r\n\r\n")
-                    await self.writer.drain()
-            except (ConnectionError, asyncio.CancelledError):
+                    await asyncio.wait_for(self.writer.drain(), WRITE_TIMEOUT)
+            except (ConnectionError, asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             self.writer.close()
             try:

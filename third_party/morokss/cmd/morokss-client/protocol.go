@@ -19,10 +19,11 @@ import (
 )
 
 const (
-	websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	dataChunk     = 8 * 1024
-	maxWSPayload  = 64 * 1024
-	maxDatagram   = 65507
+	websocketGUID      = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	dataChunk          = 8 * 1024
+	maxWSPayload       = 64 * 1024
+	maxDatagram        = 65507
+	tunnelWriteTimeout = 15 * time.Second
 )
 
 var paddingBuckets = []int{256, 512, 1024, 2048, 4096, 8192, 12288}
@@ -201,6 +202,8 @@ func (stream *websocketStream) sendFrame(opcode byte, payload []byte) error {
 	for index, value := range payload {
 		_ = frame.WriteByte(value ^ mask[index%4])
 	}
+	_ = stream.conn.SetWriteDeadline(time.Now().Add(tunnelWriteTimeout))
+	defer stream.conn.SetWriteDeadline(time.Time{})
 	if err := writeAll(stream.conn, frame.Bytes()); err != nil {
 		return fmt.Errorf("write WebSocket frame: %w", err)
 	}

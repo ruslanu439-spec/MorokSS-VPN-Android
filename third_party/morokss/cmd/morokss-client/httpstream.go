@@ -95,6 +95,8 @@ func (stream *httpChunkStream) sendBinary(payload []byte) error {
 	}
 	stream.writeMu.Lock()
 	defer stream.writeMu.Unlock()
+	_ = stream.conn.SetWriteDeadline(time.Now().Add(tunnelWriteTimeout))
+	defer stream.conn.SetWriteDeadline(time.Time{})
 	header := []byte(strconv.FormatInt(int64(len(payload)), 16) + "\r\n")
 	if err := writeAll(stream.conn, header); err != nil {
 		return fmt.Errorf("write HTTP chunk header: %w", err)
