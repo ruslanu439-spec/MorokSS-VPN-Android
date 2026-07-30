@@ -123,3 +123,18 @@ func TestCertificateFailureIsNotProfileFiltering(t *testing.T) {
 		t.Fatal("certificate error must not trigger another ClientHello profile")
 	}
 }
+
+func TestTLSTimeoutMovesToAnotherEndpointWithoutProfileScanning(t *testing.T) {
+	selector := newProfileSelector("auto", "", "server")
+	attempts := 0
+	opener := func(_ context.Context, _ clientConfig, _ string) (tunnelStream, error) {
+		attempts++
+		return nil, atStage(stageTLS, context.DeadlineExceeded)
+	}
+	if _, err := openTunnelWith(context.Background(), clientConfig{}, selector, opener); err == nil {
+		t.Fatal("TLS timeout must be returned")
+	}
+	if attempts != 1 {
+		t.Fatalf("TLS timeout scanned %d profiles instead of moving to another endpoint", attempts)
+	}
+}

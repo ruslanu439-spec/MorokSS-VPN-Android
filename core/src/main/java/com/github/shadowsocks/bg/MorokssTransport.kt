@@ -1,6 +1,7 @@
 package com.github.shadowsocks.bg
 
 import com.github.shadowsocks.Core
+import com.github.shadowsocks.core.BuildConfig
 import com.github.shadowsocks.database.Profile
 import com.github.shadowsocks.plugin.MorokssPlugin
 import com.github.shadowsocks.plugin.PluginConfiguration
@@ -17,6 +18,7 @@ data class MorokssTransport(
         val coverSniMode: String,
         val manifestSources: List<String>,
         val manifestPublicKey: String,
+        val insecure: Boolean,
 ) {
     companion object {
         fun from(profile: Profile): MorokssTransport? {
@@ -32,7 +34,10 @@ data class MorokssTransport(
 
             val primary = options["endpoint"].orEmpty().ifBlank { profile.formattedAddress }
             val port = endpointPort(primary)
-            val endpoints = listOf(primary, options["endpoint_ipv4"], options["endpoint_ipv6"])
+            val extraEndpoints = options["endpoints"].orEmpty().split(',')
+                    .map(String::trim).filter(String::isNotEmpty)
+            val endpoints = (listOf(primary, options["endpoint_ipv4"], options["endpoint_ipv6"]) +
+                    extraEndpoints)
                     .mapNotNull { it?.trim()?.takeIf(String::isNotEmpty) }
                     .map { addPort(it, port) }
                     .distinct()
@@ -59,6 +64,7 @@ data class MorokssTransport(
                     coverSniMode,
                     manifestSources,
                     manifestPublicKey,
+                    options["insecure"].equals("true", ignoreCase = true) && BuildConfig.DEBUG,
             )
         }
 
@@ -127,6 +133,7 @@ data class MorokssTransport(
             add("--manifest-cache")
             add(File(state, "morokss-$profileId-manifest.cache").absolutePath)
         }
+        if (insecure) add("--insecure")
         endpoints.forEach {
             add("--endpoint")
             add("$it,$hostname")

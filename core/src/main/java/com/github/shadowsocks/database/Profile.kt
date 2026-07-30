@@ -171,6 +171,11 @@ data class Profile(
                 val secret = json.optString("morokss_secret")
                 val hostname = json.optString("hostname")
                 val endpoint = json.optString("endpoint")
+                val endpoints = json.optJSONArray("endpoints")?.let { values ->
+                    (0 until values.length()).mapNotNull { index ->
+                        values.optString(index).trim().takeIf(String::isNotEmpty)
+                    }.joinToString(",")
+                } ?: ""
                 val endpointManifest = json.optJSONArray("endpoint_manifest")?.let { values ->
                     (0 until values.length()).mapNotNull { index ->
                         values.optString(index).trim().takeIf(String::isNotEmpty)
@@ -178,12 +183,14 @@ data class Profile(
                 } ?: json.optString("endpoint_manifest")
                 val manifestPublicKey = json.optString("manifest_public_key")
                 if (secret.isEmpty() || hostname.isEmpty() ||
-                        (endpoint.isEmpty() && endpointManifest.isEmpty())) return null
+                        (endpoint.isEmpty() && endpoints.isEmpty() &&
+                                endpointManifest.isEmpty())) return null
                 return tryParse(shadowsocks)?.apply {
                     val options = PluginOptions(MorokssPlugin.ID, null)
                     options["hostname"] = hostname
                     options["secret"] = secret
                     if (endpoint.isNotEmpty()) options["endpoint"] = endpoint
+                    if (endpoints.isNotEmpty()) options["endpoints"] = endpoints
                     json.optString("endpoint_ipv4").takeIf(String::isNotEmpty)?.let {
                         options["endpoint_ipv4"] = it
                     }
@@ -194,6 +201,7 @@ data class Profile(
                     options["transport"] = json.optString("transport", "auto")
                     options["cover_sni_mode"] = json.optString("cover_sni_mode",
                             if (json.has("cover_sni")) "auto" else "off")
+                    if (json.optBoolean("insecure", false)) options["insecure"] = "true"
                     if (endpointManifest.isNotEmpty()) {
                         options["endpoint_manifest"] = endpointManifest
                         options["manifest_public_key"] = manifestPublicKey

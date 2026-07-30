@@ -360,6 +360,8 @@ func probeEndpointPathWith(
 			attemptErrors = append(attemptErrors, fmt.Errorf("%s/%s: %w", transport, profile, err))
 			stage, staged := errorStage(err)
 			switch {
+			case timeoutFailure(err):
+				return err
 			case retryableTLSFailure(err):
 				profileSelector.markTLSFailure(profile)
 				failedProfiles[profile] = true

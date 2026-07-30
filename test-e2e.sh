@@ -20,10 +20,15 @@ ACTIVITY="$PKG/com.github.shadowsocks.MainActivity"
 
 # ── SS config ───────────────────────────────────────────────────────────────
 SS_ADDR="0.0.0.0:8388"
-SS_PASSWORD="testpassword123"
-SS_METHOD="aes-256-gcm"
+SS_PASSWORD="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+SS_METHOD="2022-blake3-aes-256-gcm"
 SS_HOST_FROM_EMU="10.0.2.2"
 SS_PORT=8388
+MOROKSS_PORT=18443
+MOROKSS_SECRET="android-e2e-secret-0123456789abcdef0123456789"
+MOROKSS_PID=""
+MOROKSS_CERT="/tmp/morokss-e2e-cert.pem"
+MOROKSS_KEY="/tmp/morokss-e2e-key.pem"
 
 # ── Cleanup trap ────────────────────────────────────────────────────────────
 SSSERVER_PID=""
@@ -34,6 +39,11 @@ cleanup() {
         echo "Killing ssserver (PID $SSSERVER_PID)"
         kill "$SSSERVER_PID" 2>/dev/null || true
         wait "$SSSERVER_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$MOROKSS_PID" ]] && kill -0 "$MOROKSS_PID" 2>/dev/null; then
+        echo "Killing MorokSS server (PID $MOROKSS_PID)"
+        kill "$MOROKSS_PID" 2>/dev/null || true
+        wait "$MOROKSS_PID" 2>/dev/null || true
     fi
     if [[ "${SKIP_EMULATOR_BOOT:-}" != "true" ]] && "$ADB" get-state &>/dev/null; then
         echo "Shutting down emulator..."
@@ -119,6 +129,27 @@ sleep 1
 kill -0 "$SSSERVER_PID" 2>/dev/null || fail "ssserver failed to start"
 info "ssserver running (PID $SSSERVER_PID)"
 
+info "Starting MorokSS wrapper on 0.0.0.0:$MOROKSS_PORT ..."
+openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$MOROKSS_KEY" -out "$MOROKSS_CERT" -days 1 \
+    -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
+    >/dev/null 2>&1
+MOROKSS_SECRET="$MOROKSS_SECRET" \
+PYTHONPATH="$SCRIPT_DIR/third_party/morokss" \
+python3 -m morokss.server \
+    --listen "0.0.0.0:$MOROKSS_PORT" \
+    --backend "127.0.0.1:$SS_PORT" \
+    --cert "$MOROKSS_CERT" \
+    --key "$MOROKSS_KEY" \
+    >/tmp/morokss-e2e.log 2>&1 &
+MOROKSS_PID=$!
+sleep 1
+kill -0 "$MOROKSS_PID" 2>/dev/null || {
+    cat /tmp/morokss-e2e.log >&2 || true
+    fail "MorokSS server failed to start"
+}
+info "MorokSS server running (PID $MOROKSS_PID)"
+
 # ────────────────────────────────────────────────────────────────────────────
 # Step 3: Boot emulator
 # ────────────────────────────────────────────────────────────────────────────
@@ -197,8 +228,11 @@ if ! sqlite3 /tmp/profile.db "SELECT count(*) FROM Profile;" >/dev/null 2>&1; th
     fail "Profile table not found — database may not have been initialized"
 fi
 
-# Modify the profile using host sqlite3
-sqlite3 /tmp/profile.db "UPDATE Profile SET host='$SS_HOST_FROM_EMU', remotePort=$SS_PORT, password='$SS_PASSWORD', method='$SS_METHOD', name='Test Server' WHERE id=1;"
+# Modify the profile using host sqlite3. This exercises the same built-in
+# MorokSS process, Android socket protection, Shadowsocks client and VPN path
+# used by imported production profiles.
+MOROKSS_PLUGIN="morokss;hostname=localhost;secret=$MOROKSS_SECRET;endpoint=$SS_HOST_FROM_EMU:$MOROKSS_PORT;profile=chrome;transport=websocket;cover_sni_mode=off;insecure=true"
+sqlite3 /tmp/profile.db "UPDATE Profile SET host='$SS_HOST_FROM_EMU', remotePort=$MOROKSS_PORT, password='$SS_PASSWORD', method='$SS_METHOD', name='MorokSS E2E', remoteDns='1.1.1.1', udpdns=1, plugin='$MOROKSS_PLUGIN' WHERE id=1;"
 
 # Verify update
 info "  Verifying profile update..."
@@ -359,7 +393,7 @@ fi
 
 # Dump sslocal-related logcat for debugging
 info "  Recent sslocal/VPN logcat:"
-"$ADB" logcat -d 2>/dev/null | grep -iE "shadowsocks|sslocal|ssservice|vpn|tun" | tail -20 || true
+"$ADB" logcat -d 2>/dev/null | grep -iE "morokss|shadowsocks|sslocal|ssservice|vpn|tun" | tail -40 || true
 
 # ────────────────────────────────────────────────────────────────────────────
 # Step 8: Test connectivity from inside the emulator
