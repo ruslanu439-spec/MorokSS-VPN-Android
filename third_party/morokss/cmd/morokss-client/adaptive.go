@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -63,6 +64,14 @@ func retryableTLSFailure(err error) bool {
 	return !errors.As(err, &unknownAuthority) &&
 		!errors.As(err, &hostnameError) &&
 		!errors.As(err, &invalidCertificate)
+}
+
+func timeoutFailure(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
 }
 
 type profileFailure struct {

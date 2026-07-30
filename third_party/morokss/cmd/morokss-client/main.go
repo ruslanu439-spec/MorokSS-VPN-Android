@@ -244,6 +244,9 @@ func openTunnelWith(ctx context.Context, config clientConfig, selector *profileS
 		lastError = err
 		stage, _ := errorStage(err)
 		log.Printf("TLS profile %s failed at %s stage: %v", profile, stage, errors.Unwrap(err))
+		if timeoutFailure(err) {
+			return nil, err
+		}
 		if !retryableTLSFailure(err) {
 			return nil, err
 		}
@@ -275,7 +278,7 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 	}
 	tlsConn := utls.UClient(raw, tlsConfig, profile)
 	tlsConn.SetSessionCache(sessionCache)
-	_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = tlsConn.SetDeadline(time.Now().Add(7 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
 		_ = raw.Close()
 		return nil, atStage(stageTLS, fmt.Errorf("TLS handshake: %w", err))
