@@ -14,6 +14,9 @@
         <item android:id="@+id/globalSettings"
               android:title="@string/settings"
               android:icon="@drawable/ic_action_settings"/>
+        <item android:id="@+id/diagnostics"
+              android:title="@string/diagnostics_title"
+              android:icon="@drawable/ic_device_data_usage"/>
     </group>
     <group android:id="@+id/misc"
            android:checkableBehavior="single">

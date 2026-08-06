@@ -310,6 +310,8 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 		protocolName = "morokss.udp.v1"
 	} else if config.network == networkProbe {
 		protocolName = "morokss.probe.v1"
+	} else if config.network == networkClamp {
+		protocolName = "morokss.clamp.v1"
 	}
 	hostHeader := tlsName
 	request := strings.Join([]string{

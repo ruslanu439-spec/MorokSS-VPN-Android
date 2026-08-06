@@ -200,6 +200,7 @@ class MainActivity : AppCompatActivity(), ShadowsocksConnection.Callback, OnPref
                     connection.bandwidthTimeout = connection.bandwidthTimeout   // request stats update
                 }
                 R.id.globalSettings -> displayFragment(GlobalSettingsFragment())
+                R.id.diagnostics -> displayFragment(DiagnosticsFragment())
                 R.id.about -> {
                     displayFragment(AboutFragment())
                 }

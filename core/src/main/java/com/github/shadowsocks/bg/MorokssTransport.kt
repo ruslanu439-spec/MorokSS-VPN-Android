@@ -143,4 +143,11 @@ data class MorokssTransport(
             add(File(state, "protect_path").absolutePath)
         }
     }
+
+    fun diagnosticCommand(nativeLibraryDir: String, profileId: Long, networkScope: String): List<String> =
+            command(nativeLibraryDir, false, profileId, networkScope) + listOf(
+                    "--diagnose",
+                    "--diagnose-network",
+                    "tcp",
+            )
 }

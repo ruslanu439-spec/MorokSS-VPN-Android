@@ -77,3 +77,27 @@ func TestSupportedDiagnosticNetwork(t *testing.T) {
 		t.Fatal("unexpected diagnostic network support")
 	}
 }
+
+func TestClassifyFlowLimit(t *testing.T) {
+	ready := clampTrial{Status: "complete"}
+	failed := clampTrial{Status: "failed"}
+	freshReady := clampDirectionResult{FreshComplete: 8, FreshPlanned: 8}
+	tests := []struct {
+		name     string
+		upload   clampDirectionResult
+		download clampDirectionResult
+		want     string
+	}{
+		{"clear", clampDirectionResult{LongFlow: ready}, clampDirectionResult{LongFlow: ready}, "no_per_flow_limit_observed"},
+		{"bidirectional", clampDirectionResult{LongFlow: failed, FreshComplete: freshReady.FreshComplete}, clampDirectionResult{LongFlow: failed, FreshComplete: freshReady.FreshComplete}, "likely_bidirectional_per_flow_limit"},
+		{"directional", clampDirectionResult{LongFlow: failed, FreshComplete: 8}, clampDirectionResult{LongFlow: ready}, "likely_directional_per_flow_limit"},
+		{"aggregate", clampDirectionResult{LongFlow: failed}, clampDirectionResult{LongFlow: failed}, "possible_endpoint_or_aggregate_filtering"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyFlowLimit(test.upload, test.download); got != test.want {
+				t.Fatalf("classifyFlowLimit() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}

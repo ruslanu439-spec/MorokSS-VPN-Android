@@ -5,4 +5,16 @@
     <string name="faq_url">https://github.com/ruslanu439-spec/MorokSS-VPN-Android/blob/master/MOROKSS.md</string>
     <string name="action_paste_json">Paste MorokSS JSON</string>
     <string name="morokss_json_hint">Paste the whole JSON configuration here</string>
+    <string name="diagnostics_title">Network diagnostics</string>
+    <string name="diagnostics_explanation">Compares a long TLS flow with fresh short connections in both directions. Stop the VPN before running. The report excludes the server address, hostname, password, and MorokSS secret.</string>
+    <string name="diagnostics_run">Run diagnostics</string>
+    <string name="diagnostics_save">Save private JSON</string>
+    <string name="diagnostics_ready">Ready. The test can take up to five minutes.</string>
+    <string name="diagnostics_running">Testing the current network… Keep the app open.</string>
+    <string name="diagnostics_complete">Complete. Save the JSON and send it for analysis.</string>
+    <string name="diagnostics_vpn_active">Stop the VPN before running a direct-network diagnostic.</string>
+    <string name="diagnostics_no_profile">Select a MorokSS profile first.</string>
+    <string name="diagnostics_failed">The diagnostic could not produce a valid report.</string>
+    <string name="diagnostics_saved">Diagnostic report saved.</string>
+    <string name="diagnostics_save_failed">Could not save the report.</string>
 </resources>

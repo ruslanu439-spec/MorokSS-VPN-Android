@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import json
 import secrets
 import ssl
 import time
@@ -30,6 +31,8 @@ from .protocol import (
 
 PROBE_BYTES = 96 * 1024
 PROBE_CHUNK = 4 * 1024
+CLAMP_MAX_BYTES = 256 * 1024
+CLAMP_MAX_CHUNK = 16 * 1024
 
 
 class AdmissionControl:
@@ -86,6 +89,102 @@ async def run_path_probe(tunnel: WebSocketStream | HTTPChunkStream) -> None:
         await tunnel.send_binary(pack_envelope(chunk))
         remaining -= len(chunk)
     await tunnel.send_binary(pack_envelope(b"down:" + download_hash.digest()))
+    await tunnel.close()
+
+
+async def run_clamp_probe(
+    tunnel: WebSocketStream | HTTPChunkStream,
+) -> None:
+    """Run a sized, correlated probe used to distinguish per-flow clamps."""
+    started = time.monotonic()
+    request_data = unpack_envelope(
+        await asyncio.wait_for(tunnel.receive_binary(), timeout=8.0)
+    )
+    try:
+        request = json.loads(request_data.decode("utf-8"))
+        trace_id = request["trace_id"]
+        upload_bytes = int(request["upload_bytes"])
+        download_bytes = int(request["download_bytes"])
+        chunk_bytes = int(request["chunk_bytes"])
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProtocolError("invalid clamp probe request") from error
+    if (
+        request.get("version") != 1
+        or not isinstance(trace_id, str)
+        or len(trace_id) != 32
+        or any(character not in "0123456789abcdef" for character in trace_id)
+        or not 0 <= upload_bytes <= CLAMP_MAX_BYTES
+        or not 0 <= download_bytes <= CLAMP_MAX_BYTES
+        or not 256 <= chunk_bytes <= CLAMP_MAX_CHUNK
+        or upload_bytes + download_bytes == 0
+    ):
+        raise ProtocolError("clamp probe request is outside allowed bounds")
+
+    print(
+        "MOROKSS_DIAGNOSTIC "
+        + json.dumps(
+            {
+                "trace_id": trace_id,
+                "upload_bytes": upload_bytes,
+                "download_bytes": download_bytes,
+                "status": "started",
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+    upload_hash = hashlib.sha256()
+    received = 0
+    while received < upload_bytes:
+        data = unpack_envelope(await tunnel.receive_binary())
+        if not data or received + len(data) > upload_bytes:
+            raise ProtocolError("invalid clamp upload")
+        upload_hash.update(data)
+        received += len(data)
+    upload_ack = {
+        "version": 1,
+        "trace_id": trace_id,
+        "direction": "upload",
+        "bytes": received,
+        "sha256": upload_hash.hexdigest(),
+    }
+    await tunnel.send_binary(
+        pack_envelope(json.dumps(upload_ack, separators=(",", ":")).encode("utf-8"))
+    )
+
+    download_hash = hashlib.sha256()
+    remaining = download_bytes
+    while remaining:
+        chunk = secrets.token_bytes(min(chunk_bytes, remaining))
+        download_hash.update(chunk)
+        await tunnel.send_binary(pack_envelope(chunk))
+        remaining -= len(chunk)
+    download_ack = {
+        "version": 1,
+        "trace_id": trace_id,
+        "direction": "download",
+        "bytes": download_bytes,
+        "sha256": download_hash.hexdigest(),
+        "server_duration_ms": round((time.monotonic() - started) * 1000),
+    }
+    await tunnel.send_binary(
+        pack_envelope(json.dumps(download_ack, separators=(",", ":")).encode("utf-8"))
+    )
+    print(
+        "MOROKSS_DIAGNOSTIC "
+        + json.dumps(
+            {
+                "trace_id": trace_id,
+                "upload_bytes": upload_bytes,
+                "download_bytes": download_bytes,
+                "duration_ms": download_ack["server_duration_ms"],
+                "status": "complete",
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
     await tunnel.close()
 
 
@@ -254,7 +353,7 @@ async def handle_client(
             }
             and headers.get("content-type", "").lower()
             == "application/octet-stream"
-            and headers.get("x-stream-network", "") in {"tcp", "udp", "probe"}
+            and headers.get("x-stream-network", "") in {"tcp", "udp", "probe", "clamp"}
         )
         if not websocket_request and not http_stream_request:
             await relay_plain_http(reader, writer, raw_head, decoy)
@@ -265,7 +364,10 @@ async def handle_client(
                 value.strip()
                 for value in headers.get("sec-websocket-protocol", "").split(",")
             }
-            if "morokss.probe.v1" in requested_protocols:
+            if "morokss.clamp.v1" in requested_protocols:
+                selected_protocol = "morokss.clamp.v1"
+                network_mode = "clamp"
+            elif "morokss.probe.v1" in requested_protocols:
                 selected_protocol = "morokss.probe.v1"
                 network_mode = "probe"
             elif "morokss.udp.v1" in requested_protocols:
@@ -315,6 +417,11 @@ async def handle_client(
 
         if network_mode == "probe":
             await run_path_probe(tunnel)
+            return
+
+        if network_mode == "clamp":
+            await tunnel.send_binary(pack_envelope(b""))
+            await run_clamp_probe(tunnel)
             return
 
         backend_reader, backend_writer = await asyncio.wait_for(

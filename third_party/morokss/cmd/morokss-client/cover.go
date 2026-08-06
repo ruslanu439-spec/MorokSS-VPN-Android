@@ -22,6 +22,7 @@ const (
 	coverModeAuto = "auto"
 	coverModeOff  = "off"
 	networkProbe  = "probe"
+	networkClamp  = "clamp"
 	probeBytes    = 96 * 1024
 	probeChunk    = 4 * 1024
 )
