@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	clientVersion = "0.4.0-alpha10"
+	clientVersion = "0.4.0-alpha11"
 	diagnosticAll = "all"
 )
 
@@ -64,6 +64,8 @@ type diagnosticBurstConfig struct {
 	Enabled            bool `json:"enabled"`
 	ChunkBytes         int  `json:"chunk_bytes"`
 	Parallel           int  `json:"parallel"`
+	GlobalParallel     bool `json:"global_parallel"`
+	DownloadParallel   int  `json:"download_parallel"`
 	DownloadChunkBytes int  `json:"download_chunk_bytes,omitempty"`
 }
 
@@ -219,7 +221,7 @@ func runDiagnostics(ctx context.Context, config clientConfig, tcpPool, udpPool *
 		GeneratedAt:   time.Now().UTC(),
 		BurstUpload: diagnosticBurstConfig{
 			Enabled: config.burstUpload, ChunkBytes: config.burstChunk, Parallel: config.burstParallel,
-			DownloadChunkBytes: burstDownloadChunk,
+			GlobalParallel: true, DownloadParallel: burstReservedDownloads(config.burstParallel), DownloadChunkBytes: burstDownloadChunk,
 		},
 		Results: make([]diagnosticResult, 0, 2),
 	}
@@ -432,7 +434,8 @@ func analyzePathCharacterization(
 		Status:       "complete",
 		UploadLadder: trials,
 		RecommendedBurst: diagnosticBurstConfig{
-			Enabled: true, ChunkBytes: 1024, Parallel: 8,
+			Enabled: true, ChunkBytes: 1024, Parallel: 8, GlobalParallel: true,
+			DownloadParallel:   4,
 			DownloadChunkBytes: burstDownloadChunk,
 		},
 		Observations: make([]string, 0, 4),

@@ -149,7 +149,7 @@ func TestBurstRouteKeepsExactSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 	pool := newEndpointPool([]endpoint{item}, "", "auto", "", transportAuto, "", networkTCP)
-	base := clientConfig{protectPath: "/protect", burstSlots: make(chan struct{}, 4)}
+	base := clientConfig{protectPath: "/protect", burstSlots: make(chan struct{}, 4), burstDownloadSlots: make(chan struct{}, 2)}
 	tracked := trackEndpointTunnel(withTunnelSelection(&burstTestTunnel{}, "android", transportHTTPStream), pool, item, "cover.example")
 	route, err := routeFromEndpointTunnel(base, tracked)
 	if err != nil {
@@ -158,7 +158,8 @@ func TestBurstRouteKeepsExactSelection(t *testing.T) {
 	if route.config.server != item.Address || route.config.hostname != item.Hostname ||
 		route.config.tlsSNI != "cover.example" || route.profile != "android" ||
 		route.config.transport != transportHTTPStream || route.config.network != networkBurstUpload ||
-		route.config.protectPath != base.protectPath || route.config.burstSlots != base.burstSlots {
+		route.config.protectPath != base.protectPath || route.config.burstSlots != base.burstSlots ||
+		route.config.burstDownloadSlots != base.burstDownloadSlots {
 		t.Fatalf("exact burst route was not preserved: %#v", route)
 	}
 }
@@ -207,6 +208,14 @@ func TestBurstSlotsAreProcessShared(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseBurstSlot(slots)
+}
+
+func TestBurstDownloadParallelReservesUploadCapacity(t *testing.T) {
+	for global, want := range map[int]int{1: 1, 2: 1, 3: 1, 4: 2, 8: 4} {
+		if got := burstReservedDownloads(global); got != want {
+			t.Fatalf("burstReservedDownloads(%d) = %d, want %d", global, got, want)
+		}
+	}
 }
 
 func TestReadBurstChunkCoalescesSmallWrites(t *testing.T) {

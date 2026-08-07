@@ -403,9 +403,18 @@ func downloadBurstChunkWithRetry(ctx context.Context, route burstRoute, sessionI
 		if err := ctx.Err(); err != nil {
 			return burstDownloadResult{}, err
 		}
+		if err := acquireBurstSlot(ctx, route.config.burstDownloadSlots); err != nil {
+			return burstDownloadResult{}, err
+		}
+		if err := acquireBurstSlot(ctx, route.config.burstSlots); err != nil {
+			releaseBurstSlot(route.config.burstDownloadSlots)
+			return burstDownloadResult{}, err
+		}
 		attemptCtx, cancel := context.WithTimeout(ctx, burstAttemptTimeout)
 		result, err := downloadBurstChunk(attemptCtx, route, sessionID, sequence)
 		cancel()
+		releaseBurstSlot(route.config.burstSlots)
+		releaseBurstSlot(route.config.burstDownloadSlots)
 		if err == nil {
 			return result, nil
 		}
@@ -614,6 +623,14 @@ func acquireBurstSlot(ctx context.Context, slots chan struct{}) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func burstReservedDownloads(globalParallel int) int {
+	parallel := globalParallel / 2
+	if parallel < 1 {
+		return 1
+	}
+	return parallel
 }
 
 func releaseBurstSlot(slots chan struct{}) {

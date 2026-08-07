@@ -50,6 +50,7 @@ type clientConfig struct {
 	burstChunk         int
 	burstParallel      int
 	burstSlots         chan struct{}
+	burstDownloadSlots chan struct{}
 }
 
 var sessionCache = utls.NewLRUClientSessionCache(64)
@@ -157,7 +158,12 @@ func main() {
 		log.Fatal(err)
 	}
 	if config.burstUpload {
-		config.burstSlots = make(chan struct{}, config.burstParallel)
+		globalSlots := config.burstParallel
+		if globalSlots < 2 {
+			globalSlots = 2
+		}
+		config.burstSlots = make(chan struct{}, globalSlots)
+		config.burstDownloadSlots = make(chan struct{}, burstReservedDownloads(config.burstParallel))
 	}
 	if diagnose && !supportedDiagnosticNetwork(diagnoseNetwork) {
 		log.Fatalf("unsupported --diagnose-network %q", diagnoseNetwork)
