@@ -401,7 +401,8 @@ func openAnyEndpoint(ctx context.Context, config clientConfig, pool *endpointPoo
 		}
 		for _, cover := range covers {
 			current.tlsSNI = cover
-			if coverSelector.needsProbe(cover) {
+			forcedBurst := config.burstUpload && config.network == networkBurstOpen
+			if coverSelector.needsProbe(cover) && !forcedBurst {
 				probeConfig := current
 				probeConfig.network = networkProbe
 				err := probeEndpointPath(ctx, probeConfig, pool.profileFor(item), pool.transportFor(item))
@@ -418,6 +419,9 @@ func openAnyEndpoint(ctx context.Context, config clientConfig, pool *endpointPoo
 			tunnel, err := openEndpointTunnel(ctx, current, pool.profileFor(item), pool.transportFor(item))
 			if err == nil {
 				pool.markSuccess(item)
+				if forcedBurst {
+					coverSelector.markSuccess(cover)
+				}
 				return trackEndpointTunnel(tunnel, pool, item, cover), nil
 			}
 			coverSelector.markFailure(cover)

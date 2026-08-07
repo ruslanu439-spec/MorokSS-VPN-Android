@@ -19,6 +19,9 @@ data class MorokssTransport(
         val manifestSources: List<String>,
         val manifestPublicKey: String,
         val insecure: Boolean,
+        val burstUpload: Boolean,
+        val burstChunk: Int,
+        val burstParallel: Int,
 ) {
     companion object {
         fun from(profile: Profile): MorokssTransport? {
@@ -54,6 +57,17 @@ data class MorokssTransport(
             require(manifestSources.isEmpty() == manifestPublicKey.isEmpty()) {
                 "MorokSS: endpoint_manifest and manifest_public_key must be set together"
             }
+            val burstUpload = options["burst_upload"].equals("true", ignoreCase = true)
+            val burstChunk = options["burst_chunk"].orEmpty().ifBlank { "4096" }.toIntOrNull()
+                    ?: throw IllegalArgumentException("MorokSS: burst_chunk must be an integer")
+            require(burstChunk in 1024..8192) {
+                "MorokSS: burst_chunk must be between 1024 and 8192 bytes"
+            }
+            val burstParallel = options["burst_parallel"].orEmpty().ifBlank { "2" }.toIntOrNull()
+                    ?: throw IllegalArgumentException("MorokSS: burst_parallel must be an integer")
+            require(burstParallel in 1..8) {
+                "MorokSS: burst_parallel must be between 1 and 8"
+            }
             return MorokssTransport(
                     hostname,
                     secret,
@@ -65,6 +79,9 @@ data class MorokssTransport(
                     manifestSources,
                     manifestPublicKey,
                     options["insecure"].equals("true", ignoreCase = true) && BuildConfig.DEBUG,
+                    burstUpload,
+                    burstChunk,
+                    burstParallel,
             )
         }
 
@@ -134,6 +151,13 @@ data class MorokssTransport(
             add(File(state, "morokss-$profileId-manifest.cache").absolutePath)
         }
         if (insecure) add("--insecure")
+        if (burstUpload) {
+            add("--burst-upload")
+            add("--burst-chunk")
+            add(burstChunk.toString())
+            add("--burst-parallel")
+            add(burstParallel.toString())
+        }
         endpoints.forEach {
             add("--endpoint")
             add("$it,$hostname")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -75,6 +76,27 @@ func TestSupportedDiagnosticNetwork(t *testing.T) {
 	}
 	if supportedDiagnosticNetwork("icmp") {
 		t.Fatal("unexpected diagnostic network support")
+	}
+}
+
+func TestDiagnosticReportIncludesPrivacySafeBurstConfig(t *testing.T) {
+	report, _ := runDiagnostics(
+		context.Background(),
+		clientConfig{burstUpload: true, burstChunk: 8192, burstParallel: 4},
+		nil,
+		nil,
+		networkUDP,
+		false,
+	)
+	if !report.BurstUpload.Enabled || report.BurstUpload.ChunkBytes != 8192 || report.BurstUpload.Parallel != 4 {
+		t.Fatalf("unexpected diagnostic burst config: %#v", report.BurstUpload)
+	}
+	var encoded bytes.Buffer
+	if err := writeDiagnosticReport(&encoded, report); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(encoded.String(), `"burst_upload"`) || strings.Contains(encoded.String(), "MOROKSS_SECRET") {
+		t.Fatalf("unexpected diagnostic report: %s", encoded.String())
 	}
 }
 

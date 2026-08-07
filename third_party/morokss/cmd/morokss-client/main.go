@@ -46,6 +46,10 @@ type clientConfig struct {
 	coverCachePath     string
 	networkScope       string
 	diagnostics        *diagnosticTrace
+	burstUpload        bool
+	burstChunk         int
+	burstParallel      int
+	burstSlots         chan struct{}
 }
 
 var sessionCache = utls.NewLRUClientSessionCache(64)
@@ -78,6 +82,9 @@ func main() {
 	flag.BoolVar(&diagnose, "diagnose", false, "test tunnel readiness and print a privacy-safe JSON report instead of starting local listeners")
 	flag.StringVar(&diagnoseNetwork, "diagnose-network", networkTCP, "network to test with --diagnose: tcp, udp, or all")
 	flag.BoolVar(&diagnoseIncludeEndpoints, "diagnose-include-endpoints", false, "include endpoint addresses and TLS hostnames in the diagnostic report")
+	flag.BoolVar(&config.burstUpload, "burst-upload", false, "split TCP uploads across fresh authenticated TLS connections")
+	flag.IntVar(&config.burstChunk, "burst-chunk", defaultBurstChunk, "burst upload payload bytes per connection (1024-8192)")
+	flag.IntVar(&config.burstParallel, "burst-parallel", defaultBurstParallel, "maximum parallel burst upload connections (1-8)")
 	flag.BoolVar(&config.insecure, "insecure", false, "disable certificate verification; development only")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -146,6 +153,12 @@ func main() {
 	if config.udpListen != "" && config.udpIdleTimeout <= 0 {
 		log.Fatal("--udp-idle-timeout must be positive")
 	}
+	if err := validateBurstConfig(config); err != nil {
+		log.Fatal(err)
+	}
+	if config.burstUpload {
+		config.burstSlots = make(chan struct{}, config.burstParallel)
+	}
 	if diagnose && !supportedDiagnosticNetwork(diagnoseNetwork) {
 		log.Fatalf("unsupported --diagnose-network %q", diagnoseNetwork)
 	}
@@ -203,6 +216,9 @@ func serve(ctx context.Context, config clientConfig, pool *endpointPool) error {
 
 func handleLocal(ctx context.Context, local net.Conn, config clientConfig, pool *endpointPool) error {
 	defer local.Close()
+	if config.burstUpload {
+		return handleBurstLocal(ctx, local, config, pool)
+	}
 	tunnel, err := openAnyEndpoint(ctx, config, pool)
 	if err != nil {
 		return err
@@ -263,6 +279,15 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 	if err != nil {
 		return nil, atStage(stageTCP, fmt.Errorf("connect to server: %w", err))
 	}
+	openFinished := make(chan struct{})
+	defer close(openFinished)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = raw.Close()
+		case <-openFinished:
+		}
+	}()
 	profile, _ := clientHelloID(profileName)
 	tlsName := config.tlsSNI
 	if tlsName == "" {
@@ -278,12 +303,11 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 	}
 	tlsConn := utls.UClient(raw, tlsConfig, profile)
 	tlsConn.SetSessionCache(sessionCache)
-	_ = tlsConn.SetDeadline(time.Now().Add(7 * time.Second))
+	_ = tlsConn.SetDeadline(time.Now().Add(15 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
 		_ = raw.Close()
 		return nil, atStage(stageTLS, fmt.Errorf("TLS handshake: %w", err))
 	}
-	_ = tlsConn.SetDeadline(time.Time{})
 	negotiated := tlsConn.ConnectionState().NegotiatedProtocol
 	if negotiated != "" && negotiated != "http/1.1" {
 		_ = tlsConn.Close()
@@ -312,6 +336,10 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 		protocolName = "morokss.probe.v1"
 	} else if config.network == networkClamp {
 		protocolName = "morokss.clamp.v1"
+	} else if config.network == networkBurstOpen {
+		protocolName = "morokss.burst.open.v1"
+	} else if config.network == networkBurstUpload {
+		protocolName = "morokss.burst.upload.v1"
 	}
 	hostHeader := tlsName
 	request := strings.Join([]string{
@@ -363,9 +391,9 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 		stream.close()
 		return nil, atStage(stageAuth, fmt.Errorf("send authentication: %w", err))
 	}
-	if config.network == networkUDP && selectedProtocol != protocolName {
+	if (config.network == networkUDP || config.network == networkBurstOpen || config.network == networkBurstUpload) && selectedProtocol != protocolName {
 		stream.close()
-		return nil, atStage(stageAuth, errors.New("server does not support MorokSS UDP"))
+		return nil, atStage(stageAuth, fmt.Errorf("server does not support MorokSS network mode %q", config.network))
 	}
 	if selectedProtocol == protocolName {
 		_ = tlsConn.SetReadDeadline(time.Now().Add(8 * time.Second))
@@ -381,6 +409,7 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 			return nil, atStage(stageAuth, errors.New("invalid server readiness response"))
 		}
 	}
+	_ = tlsConn.SetDeadline(time.Time{})
 	return stream, nil
 }
 

@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	clientVersion = "0.4.0-alpha5"
+	clientVersion = "0.4.0-alpha6"
 	diagnosticAll = "all"
 )
 
@@ -52,11 +52,18 @@ type diagnosticResult struct {
 }
 
 type diagnosticReport struct {
-	SchemaVersion int                  `json:"schema_version"`
-	ClientVersion string               `json:"client_version"`
-	GeneratedAt   time.Time            `json:"generated_at"`
-	FlowLimit     *flowLimitDiagnostic `json:"flow_limit,omitempty"`
-	Results       []diagnosticResult   `json:"results"`
+	SchemaVersion int                   `json:"schema_version"`
+	ClientVersion string                `json:"client_version"`
+	GeneratedAt   time.Time             `json:"generated_at"`
+	BurstUpload   diagnosticBurstConfig `json:"burst_upload"`
+	FlowLimit     *flowLimitDiagnostic  `json:"flow_limit,omitempty"`
+	Results       []diagnosticResult    `json:"results"`
+}
+
+type diagnosticBurstConfig struct {
+	Enabled    bool `json:"enabled"`
+	ChunkBytes int  `json:"chunk_bytes"`
+	Parallel   int  `json:"parallel"`
 }
 
 type clampProbeRequest struct {
@@ -178,7 +185,10 @@ func runDiagnostics(ctx context.Context, config clientConfig, tcpPool, udpPool *
 		SchemaVersion: 2,
 		ClientVersion: clientVersion,
 		GeneratedAt:   time.Now().UTC(),
-		Results:       make([]diagnosticResult, 0, 2),
+		BurstUpload: diagnosticBurstConfig{
+			Enabled: config.burstUpload, ChunkBytes: config.burstChunk, Parallel: config.burstParallel,
+		},
+		Results: make([]diagnosticResult, 0, 2),
 	}
 	successful := true
 	if network == networkTCP || network == diagnosticAll {

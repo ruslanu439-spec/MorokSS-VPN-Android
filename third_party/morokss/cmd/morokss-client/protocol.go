@@ -68,6 +68,35 @@ func packEnvelope(data []byte, random io.Reader) ([]byte, error) {
 	return packPayload(data, dataChunk, random)
 }
 
+// packBurstEnvelope deliberately avoids the ordinary envelope's occasional
+// promotion to the next padding bucket. Burst uploads need a predictable wire
+// budget: the default 4096-byte chunk is therefore always carried in an
+// 8192-byte envelope, never a 12288-byte one. Larger explicitly configured
+// chunks use the minimum possible envelope instead of adding more padding.
+func packBurstEnvelope(data []byte, random io.Reader) ([]byte, error) {
+	if len(data) > dataChunk {
+		return nil, fmt.Errorf("payload exceeds %d bytes", dataChunk)
+	}
+	required := len(data) + 2
+	bucket := required
+	for _, candidate := range paddingBuckets {
+		if candidate > 8192 {
+			break
+		}
+		if candidate >= required {
+			bucket = candidate
+			break
+		}
+	}
+	payload := make([]byte, bucket)
+	binary.BigEndian.PutUint16(payload[:2], uint16(len(data)))
+	copy(payload[2:], data)
+	if _, err := io.ReadFull(random, payload[2+len(data):]); err != nil {
+		return nil, fmt.Errorf("read envelope padding: %w", err)
+	}
+	return payload, nil
+}
+
 func packDatagram(data []byte, random io.Reader) ([]byte, error) {
 	return packPayload(data, maxDatagram, random)
 }

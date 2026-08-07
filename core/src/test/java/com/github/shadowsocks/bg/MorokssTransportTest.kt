@@ -25,6 +25,9 @@ class MorokssTransportTest {
         assertEquals("auto", transport.tlsProfile)
         assertEquals("auto", transport.wireTransport)
         assertEquals("auto", transport.coverSniMode)
+        assertEquals(false, transport.burstUpload)
+        assertEquals(4096, transport.burstChunk)
+        assertEquals(2, transport.burstParallel)
         assertTrue(transport.insecure)
         assertEquals(listOf("one.example.com", "two.example.com"), transport.coverSnis)
         assertEquals(listOf(
@@ -34,6 +37,40 @@ class MorokssTransportTest {
                 "edge2.example.com:8443",
                 "203.0.113.20:2053",
         ), transport.endpoints)
+    }
+
+    @Test
+    fun parsesBurstUploadSettings() {
+        val options = PluginOptions(MorokssPlugin.ID, null).apply {
+            put("hostname", "vpn.example.com")
+            put("secret", "0123456789abcdef0123456789abcdef")
+            put("endpoint", "edge.example.com:443")
+            put("burst_upload", "true")
+            put("burst_chunk", "4096")
+            put("burst_parallel", "2")
+        }
+        val transport = MorokssTransport.from(Profile(plugin = options.toString(false)))!!
+
+        assertTrue(transport.burstUpload)
+        assertEquals(4096, transport.burstChunk)
+        assertEquals(2, transport.burstParallel)
+    }
+
+    @Test
+    fun rejectsUnsafeBurstSettings() {
+        val options = PluginOptions(MorokssPlugin.ID, null).apply {
+            put("hostname", "vpn.example.com")
+            put("secret", "0123456789abcdef0123456789abcdef")
+            put("endpoint", "edge.example.com:443")
+            put("burst_upload", "true")
+            put("burst_chunk", "16384")
+        }
+        try {
+            MorokssTransport.from(Profile(plugin = options.toString(false)))
+            throw AssertionError("oversized burst chunk was accepted")
+        } catch (error: IllegalArgumentException) {
+            assertTrue(error.message.orEmpty().contains("8192"))
+        }
     }
 
     @Test

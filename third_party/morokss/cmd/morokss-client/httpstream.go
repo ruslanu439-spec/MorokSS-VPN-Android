@@ -86,6 +86,7 @@ func openHTTPStreamTunnel(_ context.Context, conn net.Conn, reader *bufio.Reader
 		stream.close()
 		return nil, atStage(stageAuth, errors.New("invalid server readiness response"))
 	}
+	_ = conn.SetDeadline(time.Time{})
 	return stream, nil
 }
 

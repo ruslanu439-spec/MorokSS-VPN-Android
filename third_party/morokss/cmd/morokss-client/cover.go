@@ -19,12 +19,14 @@ import (
 )
 
 const (
-	coverModeAuto = "auto"
-	coverModeOff  = "off"
-	networkProbe  = "probe"
-	networkClamp  = "clamp"
-	probeBytes    = 96 * 1024
-	probeChunk    = 4 * 1024
+	coverModeAuto      = "auto"
+	coverModeOff       = "off"
+	networkProbe       = "probe"
+	networkClamp       = "clamp"
+	networkBurstOpen   = "burst-open"
+	networkBurstUpload = "burst-upload"
+	probeBytes         = 96 * 1024
+	probeChunk         = 4 * 1024
 )
 
 type stringList []string

@@ -8,7 +8,8 @@ import json
 import secrets
 import ssl
 import time
-from collections import deque
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field
 from http import HTTPStatus
 
 from .protocol import (
@@ -33,6 +34,484 @@ PROBE_BYTES = 96 * 1024
 PROBE_CHUNK = 4 * 1024
 CLAMP_MAX_BYTES = 256 * 1024
 CLAMP_MAX_CHUNK = 16 * 1024
+BURST_MAX_DATA = 8 * 1024
+BURST_MAX_PENDING_CHUNKS = 32
+BURST_MAX_PENDING_BYTES = 128 * 1024
+BURST_MAX_SEQUENCE_GAP = 64
+BURST_MAX_SESSIONS = 256
+BURST_MAX_SESSIONS_PER_SECRET = 64
+BURST_MAX_ACTIVE_UPLOADS = 8
+BURST_IDLE_TIMEOUT = 10 * 60.0
+BURST_COMPLETED_WINDOW = 128
+BURST_CONNECTIONS_PER_MINUTE = 2_400
+BURST_ACTIVE_CONNECTIONS_PER_SECRET = 64
+BURST_IO_TIMEOUT = 15.0
+
+
+@dataclass
+class BurstSession:
+    """One backend stream shared by a control flow and short upload flows."""
+
+    backend_reader: asyncio.StreamReader
+    backend_writer: asyncio.StreamWriter
+    max_pending_chunks: int = BURST_MAX_PENDING_CHUNKS
+    max_pending_bytes: int = BURST_MAX_PENDING_BYTES
+    max_sequence_gap: int = BURST_MAX_SEQUENCE_GAP
+    max_active_uploads: int = BURST_MAX_ACTIVE_UPLOADS
+    completed_window: int = BURST_COMPLETED_WINDOW
+    next_sequence: int = 0
+    pending_bytes: int = 0
+    active_uploads: int = 0
+    fin_sequence: int | None = None
+    fin_written: bool = False
+    download_finished: bool = False
+    failed: bool = False
+    closed: bool = False
+    pending: dict[int, tuple[bytes, bool]] = field(default_factory=dict)
+    completed: OrderedDict[int, tuple[int, bytes, bool]] = field(
+        default_factory=OrderedDict
+    )
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    upload_finished: asyncio.Event = field(default_factory=asyncio.Event)
+    last_activity: float = field(default_factory=time.monotonic)
+
+    def touch(self) -> None:
+        self.last_activity = time.monotonic()
+
+    def idle_at(self, now: float, timeout: float) -> bool:
+        return self.active_uploads == 0 and now - self.last_activity >= timeout
+
+    async def begin_upload(self) -> None:
+        async with self.lock:
+            if self.closed:
+                raise ProtocolError("burst session is closed")
+            if self.active_uploads >= self.max_active_uploads:
+                raise ProtocolError("too many active burst uploads")
+            self.active_uploads += 1
+            self.touch()
+
+    async def end_upload(self) -> None:
+        async with self.lock:
+            self.active_uploads = max(0, self.active_uploads - 1)
+            self.touch()
+
+    async def submit(
+        self, sequence: int, data: bytes, fin: bool
+    ) -> tuple[str, int, bool]:
+        """Queue a chunk, flush contiguous chunks, and report its disposition."""
+        async with self.lock:
+            if self.closed:
+                raise ProtocolError("burst session is closed")
+            if len(data) > BURST_MAX_DATA:
+                raise ProtocolError("burst chunk is too large")
+            if sequence < self.next_sequence:
+                completed = self.completed.get(sequence)
+                if completed is not None and completed != (
+                    len(data),
+                    hashlib.sha256(data).digest(),
+                    fin,
+                ):
+                    raise ProtocolError("conflicting completed burst chunk")
+                self.touch()
+                return "duplicate", self.next_sequence, self.fin_written
+            if sequence - self.next_sequence > self.max_sequence_gap:
+                raise ProtocolError("burst sequence is too far ahead")
+            if self.fin_sequence is not None:
+                if sequence > self.fin_sequence or (fin and sequence != self.fin_sequence):
+                    raise ProtocolError("burst chunk is after the final sequence")
+
+            existing = self.pending.get(sequence)
+            if existing is not None:
+                if existing != (data, fin):
+                    raise ProtocolError("conflicting duplicate burst chunk")
+                self.touch()
+                return "duplicate", self.next_sequence, self.fin_written
+
+            if fin:
+                if any(pending_sequence > sequence for pending_sequence in self.pending):
+                    raise ProtocolError("burst final sequence precedes pending data")
+                self.fin_sequence = sequence
+
+            # The missing next chunk is always allowed because it immediately frees
+            # any contiguous pending data. Future chunks consume the bounded buffer.
+            if sequence != self.next_sequence and (
+                len(self.pending) >= self.max_pending_chunks
+                or self.pending_bytes + len(data) > self.max_pending_bytes
+            ):
+                if fin:
+                    self.fin_sequence = None
+                raise ProtocolError("burst pending buffer is full")
+
+            self.pending[sequence] = (data, fin)
+            self.pending_bytes += len(data)
+            while self.next_sequence in self.pending:
+                completed_sequence = self.next_sequence
+                payload, chunk_fin = self.pending.pop(completed_sequence)
+                self.pending_bytes -= len(payload)
+                if payload:
+                    try:
+                        self.backend_writer.write(payload)
+                        await asyncio.wait_for(
+                            self.backend_writer.drain(), BURST_IO_TIMEOUT
+                        )
+                    except (ConnectionError, OSError, asyncio.TimeoutError):
+                        self._fail_locked()
+                        raise
+                self.completed[completed_sequence] = (
+                    len(payload),
+                    hashlib.sha256(payload).digest(),
+                    chunk_fin,
+                )
+                while len(self.completed) > self.completed_window:
+                    self.completed.popitem(last=False)
+                self.next_sequence += 1
+                if chunk_fin:
+                    can_write_eof = getattr(self.backend_writer, "can_write_eof", None)
+                    if callable(can_write_eof) and can_write_eof():
+                        try:
+                            self.backend_writer.write_eof()
+                            await asyncio.wait_for(
+                                self.backend_writer.drain(), BURST_IO_TIMEOUT
+                            )
+                        except (ConnectionError, OSError, asyncio.TimeoutError):
+                            self._fail_locked()
+                            raise
+                    self.fin_written = True
+                    self.upload_finished.set()
+                    break
+
+            self.touch()
+            status = "written" if sequence < self.next_sequence else "pending"
+            return status, self.next_sequence, self.fin_written
+
+    def _fail_locked(self) -> None:
+        self.failed = True
+        self.closed = True
+        self.pending.clear()
+        self.pending_bytes = 0
+        self.upload_finished.set()
+        self.backend_writer.close()
+
+    async def close(self) -> None:
+        async with self.lock:
+            self.closed = True
+            self.pending.clear()
+            self.pending_bytes = 0
+            self.upload_finished.set()
+            if not self.backend_writer.is_closing():
+                self.backend_writer.close()
+        with contextlib.suppress(ConnectionError, asyncio.TimeoutError):
+            await asyncio.wait_for(
+                self.backend_writer.wait_closed(), BURST_IO_TIMEOUT
+            )
+
+
+BurstSessionKey = tuple[bytes, str]
+
+
+class BurstSessionRegistry:
+    """Bounded registry; keys never contain raw client secrets."""
+
+    def __init__(
+        self,
+        max_sessions: int = BURST_MAX_SESSIONS,
+        max_sessions_per_secret: int = BURST_MAX_SESSIONS_PER_SECRET,
+        max_active_uploads: int = BURST_MAX_ACTIVE_UPLOADS,
+        idle_timeout: float = BURST_IDLE_TIMEOUT,
+    ) -> None:
+        if (
+            max_sessions <= 0
+            or max_sessions_per_secret <= 0
+            or max_active_uploads <= 0
+            or idle_timeout <= 0
+        ):
+            raise ValueError("burst session limits must be positive")
+        self.max_sessions = max_sessions
+        self.max_sessions_per_secret = max_sessions_per_secret
+        self.max_active_uploads = max_active_uploads
+        self.idle_timeout = idle_timeout
+        self.sessions: dict[BurstSessionKey, BurstSession] = {}
+        self.opening: set[BurstSessionKey] = set()
+        self.lock = asyncio.Lock()
+
+    async def open(
+        self, key: BurstSessionKey, backend: tuple[str, int]
+    ) -> BurstSession:
+        async with self.lock:
+            if key in self.sessions or key in self.opening:
+                raise ProtocolError("burst session already exists")
+            if len(self.sessions) + len(self.opening) >= self.max_sessions:
+                raise ProtocolError("burst session limit reached")
+            secret_scope = key[0]
+            secret_sessions = sum(
+                session_key[0] == secret_scope
+                for session_key in (*self.sessions.keys(), *self.opening)
+            )
+            if secret_sessions >= self.max_sessions_per_secret:
+                raise ProtocolError("burst per-secret session limit reached")
+            self.opening.add(key)
+
+        backend_writer: asyncio.StreamWriter | None = None
+        try:
+            backend_reader, backend_writer = await asyncio.wait_for(
+                asyncio.open_connection(*backend), timeout=8.0
+            )
+            session = BurstSession(
+                backend_reader,
+                backend_writer,
+                max_active_uploads=self.max_active_uploads,
+            )
+            async with self.lock:
+                self.opening.discard(key)
+                if key in self.sessions:
+                    raise ProtocolError("burst session already exists")
+                self.sessions[key] = session
+            return session
+        except BaseException:
+            async with self.lock:
+                self.opening.discard(key)
+            if backend_writer is not None:
+                backend_writer.close()
+                with contextlib.suppress(ConnectionError, asyncio.TimeoutError):
+                    await backend_writer.wait_closed()
+            raise
+
+    async def get(self, key: BurstSessionKey) -> BurstSession:
+        stale: BurstSession | None = None
+        async with self.lock:
+            session = self.sessions.get(key)
+            if session is None:
+                raise ProtocolError("unknown burst session")
+            if session.closed:
+                stale = self.sessions.pop(key)
+            else:
+                return session
+        if stale is not None:
+            await stale.close()
+        raise ProtocolError("burst session is closed")
+
+    async def remove(
+        self, key: BurstSessionKey, expected: BurstSession | None = None
+    ) -> None:
+        async with self.lock:
+            session = self.sessions.get(key)
+            if session is None or (expected is not None and session is not expected):
+                return
+            del self.sessions[key]
+        await session.close()
+
+    async def close(self) -> None:
+        async with self.lock:
+            sessions = tuple(self.sessions.values())
+            self.sessions.clear()
+        await asyncio.gather(
+            *(session.close() for session in sessions), return_exceptions=True
+        )
+
+    async def reap_idle(self) -> None:
+        """Continuously remove abandoned controls without unbounded state."""
+        interval = min(30.0, max(1.0, self.idle_timeout / 2))
+        while True:
+            await asyncio.sleep(interval)
+            await self.reap_expired()
+
+    async def reap_expired(self, now: float | None = None) -> int:
+        current = time.monotonic() if now is None else now
+        async with self.lock:
+            expired = [
+                (key, session)
+                for key, session in self.sessions.items()
+                if session.idle_at(current, self.idle_timeout)
+            ]
+            for key, _ in expired:
+                del self.sessions[key]
+        await asyncio.gather(
+            *(session.close() for _, session in expired),
+            return_exceptions=True,
+        )
+        return len(expired)
+
+
+def burst_session_key(secret: bytes, session_id: str) -> BurstSessionKey:
+    return hashlib.sha256(secret).digest(), session_id
+
+
+def _valid_burst_session_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 32
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+async def _receive_burst_json(
+    tunnel: WebSocketStream | HTTPChunkStream,
+) -> dict[str, object]:
+    payload = unpack_envelope(
+        await asyncio.wait_for(tunnel.receive_binary(), timeout=8.0)
+    )
+    try:
+        document = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProtocolError("invalid burst request") from error
+    if not isinstance(document, dict):
+        raise ProtocolError("invalid burst request")
+    return document
+
+
+async def _send_burst_json(
+    tunnel: WebSocketStream | HTTPChunkStream, document: dict[str, object]
+) -> None:
+    payload = json.dumps(document, separators=(",", ":")).encode("utf-8")
+    await tunnel.send_binary(pack_envelope(payload))
+
+
+async def run_burst_open(
+    tunnel: WebSocketStream | HTTPChunkStream,
+    registry: BurstSessionRegistry,
+    matched_secret: bytes,
+    backend: tuple[str, int],
+) -> None:
+    request = await _receive_burst_json(tunnel)
+    session_id = request.get("session_id")
+    if (
+        type(request.get("version")) is not int
+        or request.get("version") != 1
+        or not _valid_burst_session_id(session_id)
+    ):
+        raise ProtocolError("invalid burst open request")
+    assert isinstance(session_id, str)
+    key = burst_session_key(matched_secret, session_id)
+    session = await registry.open(key, backend)
+    tasks: set[asyncio.Task[object]] = set()
+
+    async def backend_to_control() -> None:
+        while data := await session.backend_reader.read(8 * 1024):
+            session.touch()
+            await tunnel.send_binary(pack_envelope(data))
+        if session.failed:
+            raise ConnectionError("burst backend upload failed")
+        session.download_finished = True
+        session.touch()
+        # An empty envelope after the open acknowledgement is an explicit
+        # downstream FIN. The backend write side remains alive for late uploads.
+        await tunnel.send_binary(pack_envelope(b""))
+
+    async def watch_control() -> bool:
+        # Upload data belongs on burst-upload flows. Reading here exists only to
+        # promptly detect a closed control flow and release the backend session.
+        try:
+            await tunnel.receive_binary()
+        except EOFError:
+            # A terminating HTTP request chunk is only a request-side half-close;
+            # the response/download side can remain alive. WebSocket close is a
+            # logical close of both directions and owns the session lifetime.
+            if not isinstance(tunnel, HTTPChunkStream):
+                return True
+            # HTTP zero-chunk only half-closes the request body. Consume its
+            # terminating CRLF, then wait for physical EOF while the response
+            # remains usable. Normal session completion cancels this watcher.
+            if await tunnel.reader.readexactly(2) != b"\r\n":
+                raise ProtocolError("invalid HTTP burst control ending")
+            if await tunnel.reader.read(1):
+                raise ProtocolError("unexpected data after HTTP burst control")
+            return True
+        raise ProtocolError("unexpected data on burst control flow")
+
+    try:
+        await _send_burst_json(
+            tunnel,
+            {
+                "version": 1,
+                "session_id": session_id,
+                "status": "open",
+            },
+        )
+        backend_task = asyncio.create_task(backend_to_control())
+        control_task = asyncio.create_task(watch_control())
+        upload_fin_task = asyncio.create_task(session.upload_finished.wait())
+        tasks = {backend_task, control_task, upload_fin_task}
+        while True:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if control_task in done:
+                control_dead = control_task.result()
+                tasks.remove(control_task)
+                if control_dead:
+                    break
+                # HTTP request half-close: the response and backend stay live.
+            if backend_task in done:
+                backend_task.result()
+            if upload_fin_task in done:
+                upload_fin_task.result()
+                if session.failed:
+                    break
+            if backend_task.done() and upload_fin_task.done():
+                break
+            if not tasks:
+                break
+            tasks.difference_update(done)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await registry.remove(key, session)
+        await tunnel.close()
+
+
+async def run_burst_upload(
+    tunnel: WebSocketStream | HTTPChunkStream,
+    registry: BurstSessionRegistry,
+    matched_secret: bytes,
+) -> None:
+    request = await _receive_burst_json(tunnel)
+    session_id = request.get("session_id")
+    sequence = request.get("sequence")
+    fin = request.get("fin")
+    length = request.get("length")
+    if (
+        type(request.get("version")) is not int
+        or request.get("version") != 1
+        or not _valid_burst_session_id(session_id)
+        or type(sequence) is not int
+        or sequence < 0
+        or type(fin) is not bool
+        or type(length) is not int
+        or not 0 <= length <= BURST_MAX_DATA
+        or (length == 0 and not fin)
+    ):
+        raise ProtocolError("invalid burst upload request")
+    assert isinstance(session_id, str)
+    assert isinstance(sequence, int)
+    assert isinstance(fin, bool)
+    assert isinstance(length, int)
+
+    session = await registry.get(burst_session_key(matched_secret, session_id))
+    await session.begin_upload()
+    try:
+        data = b""
+        if length:
+            data = unpack_envelope(
+                await asyncio.wait_for(tunnel.receive_binary(), timeout=8.0)
+            )
+            if len(data) != length:
+                raise ProtocolError("burst upload length mismatch")
+
+        status, next_sequence, fin_written = await session.submit(sequence, data, fin)
+        await _send_burst_json(
+            tunnel,
+            {
+                "version": 1,
+                "session_id": session_id,
+                "sequence": sequence,
+                "status": status,
+                "next_sequence": next_sequence,
+                "fin": fin_written,
+            },
+        )
+    finally:
+        await session.end_upload()
+        await tunnel.close()
 
 
 class AdmissionControl:
@@ -66,6 +545,105 @@ class AdmissionControl:
     async def release(self) -> None:
         async with self.lock:
             self.active = max(0, self.active - 1)
+
+    async def refund_rate_limit(self, peer: str) -> None:
+        """Return one authenticated burst attempt without changing active count."""
+        async with self.lock:
+            recent = self.attempts.get(peer)
+            if recent:
+                recent.pop()
+                if not recent:
+                    del self.attempts[peer]
+
+
+@dataclass
+class BurstAdmissionRecord:
+    tokens: float
+    last_refill: float
+    last_seen: float
+    active: int = 0
+
+
+class BurstAdmissionControl:
+    """O(1)-memory token buckets for authenticated, secret-scoped microflows."""
+
+    def __init__(
+        self,
+        max_per_minute: int = BURST_CONNECTIONS_PER_MINUTE,
+        max_active_per_secret: int = BURST_ACTIVE_CONNECTIONS_PER_SECRET,
+        max_secret_records: int = 65536,
+    ) -> None:
+        if (
+            max_per_minute <= 0
+            or max_active_per_secret <= 0
+            or max_secret_records <= 0
+        ):
+            raise ValueError("burst admission limits must be positive")
+        self.max_per_minute = max_per_minute
+        self.max_active_per_secret = max_active_per_secret
+        self.max_secret_records = max_secret_records
+        self.records: OrderedDict[bytes, BurstAdmissionRecord] = OrderedDict()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self, secret_scope: bytes) -> bool:
+        now = time.monotonic()
+        async with self.lock:
+            record = self.records.get(secret_scope)
+            if record is None:
+                while len(self.records) >= self.max_secret_records:
+                    evictable = next(
+                        (
+                            key
+                            for key, candidate in self.records.items()
+                            if candidate.active == 0
+                        ),
+                        None,
+                    )
+                    if evictable is None:
+                        return False
+                    del self.records[evictable]
+                record = BurstAdmissionRecord(
+                    tokens=float(self.max_per_minute),
+                    last_refill=now,
+                    last_seen=now,
+                )
+                self.records[secret_scope] = record
+            else:
+                elapsed = max(0.0, now - record.last_refill)
+                record.tokens = min(
+                    float(self.max_per_minute),
+                    record.tokens + elapsed * self.max_per_minute / 60.0,
+                )
+                record.last_refill = now
+                record.last_seen = now
+                self.records.move_to_end(secret_scope)
+            if record.active >= self.max_active_per_secret or record.tokens < 1.0:
+                return False
+            record.tokens -= 1.0
+            record.active += 1
+            return True
+
+    async def release(self, secret_scope: bytes) -> None:
+        async with self.lock:
+            record = self.records.get(secret_scope)
+            if record is not None:
+                record.active = max(0, record.active - 1)
+                record.last_seen = time.monotonic()
+
+
+async def acquire_authenticated_burst(
+    matched_secret: bytes,
+    admission: AdmissionControl | None,
+    admission_peer: str | None,
+    burst_admission: BurstAdmissionControl | None,
+) -> tuple[bytes, bool]:
+    """Apply secret quota first; only admitted bursts earn an IP-rate refund."""
+    secret_scope = hashlib.sha256(matched_secret).digest()
+    if burst_admission is not None and not await burst_admission.acquire(secret_scope):
+        return secret_scope, False
+    if admission is not None and admission_peer is not None:
+        await admission.refund_rate_limit(admission_peer)
+    return secret_scope, True
 
 
 async def run_path_probe(tunnel: WebSocketStream | HTTPChunkStream) -> None:
@@ -322,6 +900,10 @@ async def handle_client(
     backend: tuple[str, int],
     decoy: tuple[str, int] | None,
     replay_cache: ReplayCache,
+    burst_registry: BurstSessionRegistry | None = None,
+    admission: AdmissionControl | None = None,
+    admission_peer: str | None = None,
+    burst_admission: BurstAdmissionControl | None = None,
 ) -> None:
     try:
         secrets_to_try = (secret,) if isinstance(secret, bytes) else secret
@@ -353,7 +935,8 @@ async def handle_client(
             }
             and headers.get("content-type", "").lower()
             == "application/octet-stream"
-            and headers.get("x-stream-network", "") in {"tcp", "udp", "probe", "clamp"}
+            and headers.get("x-stream-network", "")
+            in {"tcp", "udp", "probe", "clamp", "burst-open", "burst-upload"}
         )
         if not websocket_request and not http_stream_request:
             await relay_plain_http(reader, writer, raw_head, decoy)
@@ -364,7 +947,13 @@ async def handle_client(
                 value.strip()
                 for value in headers.get("sec-websocket-protocol", "").split(",")
             }
-            if "morokss.clamp.v1" in requested_protocols:
+            if "morokss.burst.open.v1" in requested_protocols:
+                selected_protocol = "morokss.burst.open.v1"
+                network_mode = "burst-open"
+            elif "morokss.burst.upload.v1" in requested_protocols:
+                selected_protocol = "morokss.burst.upload.v1"
+                network_mode = "burst-upload"
+            elif "morokss.clamp.v1" in requested_protocols:
                 selected_protocol = "morokss.clamp.v1"
                 network_mode = "clamp"
             elif "morokss.probe.v1" in requested_protocols:
@@ -424,6 +1013,34 @@ async def handle_client(
             await run_clamp_probe(tunnel)
             return
 
+        if network_mode in {"burst-open", "burst-upload"}:
+            if burst_registry is None:
+                burst_registry = getattr(replay_cache, "_burst_registry", None)
+                if burst_registry is None:
+                    burst_registry = BurstSessionRegistry()
+                    setattr(replay_cache, "_burst_registry", burst_registry)
+            secret_scope, burst_acquired = await acquire_authenticated_burst(
+                matched_secret,
+                admission,
+                admission_peer,
+                burst_admission,
+            )
+            if not burst_acquired:
+                await tunnel.close()
+                return
+            try:
+                await tunnel.send_binary(pack_envelope(b""))
+                if network_mode == "burst-open":
+                    await run_burst_open(
+                        tunnel, burst_registry, matched_secret, backend
+                    )
+                else:
+                    await run_burst_upload(tunnel, burst_registry, matched_secret)
+            finally:
+                if burst_admission is not None:
+                    await burst_admission.release(secret_scope)
+            return
+
         backend_reader, backend_writer = await asyncio.wait_for(
             asyncio.open_connection(*backend), timeout=8.0
         )
@@ -451,7 +1068,17 @@ async def run(args: argparse.Namespace) -> None:
     decoy = parse_endpoint(args.decoy) if args.decoy else None
     secrets = load_server_secrets(args.secrets_file)
     replay_cache = ReplayCache()
+    burst_registry = BurstSessionRegistry(
+        max_sessions=args.max_burst_sessions,
+        max_sessions_per_secret=args.max_burst_sessions_per_secret,
+        max_active_uploads=args.max_burst_active_uploads,
+        idle_timeout=args.burst_idle_timeout,
+    )
     admission = AdmissionControl(args.max_clients, args.max_connections_per_minute)
+    burst_admission = BurstAdmissionControl(
+        args.max_burst_connections_per_minute,
+        args.max_burst_active_connections_per_secret,
+    )
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.minimum_version = ssl.TLSVersion.TLSv1_2
     tls.load_cert_chain(args.cert, args.key)
@@ -473,6 +1100,10 @@ async def run(args: argparse.Namespace) -> None:
                 backend=backend,
                 decoy=decoy,
                 replay_cache=replay_cache,
+                burst_registry=burst_registry,
+                admission=admission,
+                admission_peer=peer,
+                burst_admission=burst_admission,
             )
         finally:
             await admission.release()
@@ -481,6 +1112,7 @@ async def run(args: argparse.Namespace) -> None:
         limited_client,
         *listen,
         ssl=tls,
+        ssl_handshake_timeout=10.0,
         limit=128 * 1024,
     )
     addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
@@ -488,8 +1120,14 @@ async def run(args: argparse.Namespace) -> None:
         f"MorokSS server listening on {addresses}; backend={args.backend}; "
         f"accepted_secrets={len(secrets)}"
     )
-    async with server:
-        await server.serve_forever()
+    burst_reaper = asyncio.create_task(burst_registry.reap_idle())
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        burst_reaper.cancel()
+        await asyncio.gather(burst_reaper, return_exceptions=True)
+        await burst_registry.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -510,6 +1148,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-clients", type=int, default=1024)
     parser.add_argument("--max-connections-per-minute", type=int, default=240)
+    parser.add_argument(
+        "--max-burst-connections-per-minute",
+        type=int,
+        default=BURST_CONNECTIONS_PER_MINUTE,
+        help="authenticated burst microflows allowed per client secret",
+    )
+    parser.add_argument(
+        "--max-burst-active-connections-per-secret",
+        type=int,
+        default=BURST_ACTIVE_CONNECTIONS_PER_SECRET,
+    )
+    parser.add_argument(
+        "--max-burst-sessions", type=int, default=BURST_MAX_SESSIONS
+    )
+    parser.add_argument(
+        "--max-burst-sessions-per-secret",
+        type=int,
+        default=BURST_MAX_SESSIONS_PER_SECRET,
+    )
+    parser.add_argument(
+        "--max-burst-active-uploads",
+        type=int,
+        default=BURST_MAX_ACTIVE_UPLOADS,
+    )
+    parser.add_argument(
+        "--burst-idle-timeout", type=float, default=BURST_IDLE_TIMEOUT
+    )
     return parser
 
 

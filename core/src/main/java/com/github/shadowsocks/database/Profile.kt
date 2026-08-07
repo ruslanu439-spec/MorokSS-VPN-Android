@@ -199,6 +199,11 @@ data class Profile(
                     }
                     options["profile"] = json.optString("profile", "auto")
                     options["transport"] = json.optString("transport", "auto")
+                    if (json.optBoolean("burst_upload", false)) {
+                        options["burst_upload"] = "true"
+                        options["burst_chunk"] = json.optInt("burst_chunk", 4096).toString()
+                        options["burst_parallel"] = json.optInt("burst_parallel", 2).toString()
+                    }
                     options["cover_sni_mode"] = json.optString("cover_sni_mode",
                             if (json.has("cover_sni")) "auto" else "off")
                     if (json.optBoolean("insecure", false)) options["insecure"] = "true"
