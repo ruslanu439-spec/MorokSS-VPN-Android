@@ -44,7 +44,9 @@ BURST_MAX_ACTIVE_UPLOADS = 8
 BURST_IDLE_TIMEOUT = 10 * 60.0
 BURST_COMPLETED_WINDOW = 128
 BURST_DOWNLOAD_WINDOW = 8
-BURST_DOWNLOAD_WAIT = 20.0
+BURST_DOWNLOAD_WAIT = 5.0
+BURST_DOWNLOAD_FUTURE_WAIT = 8.0
+BURST_COMPLETED_LINGER = 30.0
 BURST_CONNECTIONS_PER_MINUTE = 2_400
 BURST_ACTIVE_CONNECTIONS_PER_SECRET = 64
 BURST_IO_TIMEOUT = 15.0
@@ -81,9 +83,11 @@ class BurstSession:
         default_factory=OrderedDict
     )
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    download_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    download_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     upload_finished: asyncio.Event = field(default_factory=asyncio.Event)
     download_finished_event: asyncio.Event = field(default_factory=asyncio.Event)
+    cleanup_scheduled: bool = False
+    probe_server: asyncio.AbstractServer | None = None
     last_activity: float = field(default_factory=time.monotonic)
 
     def touch(self) -> None:
@@ -95,6 +99,10 @@ class BurstSession:
             and self.active_downloads == 0
             and now - self.last_activity >= timeout
         )
+
+    async def finished(self) -> bool:
+        async with self.lock:
+            return self.failed or (self.fin_written and self.download_finished)
 
     async def begin_upload(self) -> None:
         async with self.lock:
@@ -126,11 +134,28 @@ class BurstSession:
         self, sequence: int, max_length: int
     ) -> tuple[str, int, bytes, bool]:
         """Return one retry-safe backend chunk for a client-initiated poll."""
-        async with self.download_lock:
+        async with self.download_condition:
             if self.closed:
                 raise ProtocolError("burst session is closed")
             if not 1 <= max_length <= BURST_MAX_DATA:
                 raise ProtocolError("invalid burst download length")
+            if sequence - self.download_next_sequence >= BURST_DOWNLOAD_WINDOW:
+                raise ProtocolError("burst download sequence is too far ahead")
+            deadline = asyncio.get_running_loop().time() + BURST_DOWNLOAD_FUTURE_WAIT
+            while sequence > self.download_next_sequence:
+                if self.closed:
+                    raise ProtocolError("burst session is closed")
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    self.touch()
+                    return "idle", self.download_next_sequence, b"", False
+                try:
+                    await asyncio.wait_for(
+                        self.download_condition.wait(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    self.touch()
+                    return "idle", self.download_next_sequence, b"", False
             if sequence < self.download_next_sequence:
                 cached = self.download_completed.get(sequence)
                 if cached is None:
@@ -138,8 +163,6 @@ class BurstSession:
                 self.touch()
                 data, fin = cached
                 return "duplicate", self.download_next_sequence, data, fin
-            if sequence > self.download_next_sequence:
-                raise ProtocolError("burst download sequence is too far ahead")
             if self.download_finished:
                 raise ProtocolError("burst download is already finished")
 
@@ -160,6 +183,7 @@ class BurstSession:
             while len(self.download_completed) > BURST_DOWNLOAD_WINDOW:
                 self.download_completed.popitem(last=False)
             self.download_next_sequence += 1
+            self.download_condition.notify_all()
             if fin:
                 self.download_finished = True
                 self.download_finished_event.set()
@@ -278,6 +302,13 @@ class BurstSession:
             await asyncio.wait_for(
                 self.backend_writer.wait_closed(), BURST_IO_TIMEOUT
             )
+        if self.probe_server is not None:
+            self.probe_server.close()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self.probe_server.wait_closed(), BURST_IO_TIMEOUT
+                )
+            self.probe_server = None
 
 
 BurstSessionKey = tuple[bytes, str]
@@ -306,6 +337,7 @@ class BurstSessionRegistry:
         self.idle_timeout = idle_timeout
         self.sessions: dict[BurstSessionKey, BurstSession] = {}
         self.opening: set[BurstSessionKey] = set()
+        self.cleanup_tasks: set[asyncio.Task[None]] = set()
         self.lock = asyncio.Lock()
 
     async def open(
@@ -374,7 +406,34 @@ class BurstSessionRegistry:
             del self.sessions[key]
         await session.close()
 
+    async def retire_if_complete(
+        self, key: BurstSessionKey, expected: BurstSession
+    ) -> bool:
+        if not await expected.finished():
+            return False
+        if expected.failed:
+            await self.remove(key, expected)
+            return True
+        async with self.lock:
+            if self.sessions.get(key) is not expected or expected.cleanup_scheduled:
+                return True
+            expected.cleanup_scheduled = True
+
+        async def retire() -> None:
+            await asyncio.sleep(BURST_COMPLETED_LINGER)
+            await self.remove(key, expected)
+
+        task = asyncio.create_task(retire())
+        self.cleanup_tasks.add(task)
+        task.add_done_callback(self.cleanup_tasks.discard)
+        return True
+
     async def close(self) -> None:
+        cleanup_tasks = tuple(self.cleanup_tasks)
+        self.cleanup_tasks.clear()
+        for task in cleanup_tasks:
+            task.cancel()
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
         async with self.lock:
             sessions = tuple(self.sessions.values())
             self.sessions.clear()
@@ -440,6 +499,38 @@ async def _send_burst_json(
     await tunnel.send_binary(pack_envelope(payload))
 
 
+async def _start_burst_probe_backend() -> tuple[
+    asyncio.AbstractServer, tuple[str, int], asyncio.Event
+]:
+    connected = asyncio.Event()
+
+    async def echo(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        connected.set()
+        try:
+            while data := await reader.read(BURST_MAX_DATA):
+                writer.write(data)
+                await writer.drain()
+            if writer.can_write_eof():
+                writer.write_eof()
+                await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+            with contextlib.suppress(ConnectionError, asyncio.TimeoutError):
+                await writer.wait_closed()
+
+    server = await asyncio.start_server(echo, "127.0.0.1", 0)
+    if not server.sockets:
+        server.close()
+        await server.wait_closed()
+        raise ConnectionError("burst probe backend has no socket")
+    address = server.sockets[0].getsockname()
+    return server, (str(address[0]), int(address[1])), connected
+
+
 async def run_burst_open(
     tunnel: WebSocketStream | HTTPChunkStream,
     registry: BurstSessionRegistry,
@@ -448,20 +539,39 @@ async def run_burst_open(
 ) -> None:
     request = await _receive_burst_json(tunnel)
     session_id = request.get("session_id")
+    probe = request.get("probe", False)
     if (
         type(request.get("version")) is not int
         or request.get("version") != 1
         or not _valid_burst_session_id(session_id)
+        or type(probe) is not bool
     ):
         raise ProtocolError("invalid burst open request")
     assert isinstance(session_id, str)
     key = burst_session_key(matched_secret, session_id)
-    session = await registry.open(key, backend)
+    probe_server: asyncio.AbstractServer | None = None
+    probe_connected: asyncio.Event | None = None
+    try:
+        if probe:
+            probe_server, backend, probe_connected = await _start_burst_probe_backend()
+        session = await registry.open(key, backend)
+        if probe_connected is not None:
+            await asyncio.wait_for(probe_connected.wait(), timeout=1.0)
+        if probe_server is not None:
+            session.probe_server = probe_server
+            probe_server = None
+    finally:
+        if probe_server is not None:
+            probe_server.close()
+            await probe_server.wait_closed()
     tasks: set[asyncio.Task[object]] = set()
+    keep_session = False
+    normal_complete = False
 
     async def watch_control() -> bool:
-        # Upload data belongs on burst-upload flows. Reading here exists only to
-        # promptly detect a closed control flow and release the backend session.
+        # Upload and download data belong on short Burst flows. The control flow
+        # is only an opener and may disappear on networks that kill long-lived
+        # TLS connections; its EOF must not destroy the backend session.
         try:
             await tunnel.receive_binary()
         except EOFError:
@@ -497,11 +607,10 @@ async def run_burst_open(
         download_done = False
         while True:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            control_dead = False
             if control_task in done:
                 control_dead = control_task.result()
                 tasks.remove(control_task)
-                if control_dead:
-                    break
                 # HTTP request half-close: the response and backend stay live.
             if upload_fin_task in done:
                 upload_fin_task.result()
@@ -511,7 +620,24 @@ async def run_burst_open(
                 download_fin_task.result()
                 download_done = True
                 tasks.remove(download_fin_task)
-            if session.failed or (upload_done and download_done):
+            if session.failed:
+                break
+            if upload_done and download_done:
+                normal_complete = True
+                break
+            if control_dead:
+                keep_session = True
+                print(
+                    "MOROKSS_BURST "
+                    + json.dumps(
+                        {
+                            "session": session_id[:8],
+                            "event": "control_detached",
+                        },
+                        separators=(",", ":"),
+                    ),
+                    flush=True,
+                )
                 break
             if not tasks:
                 break
@@ -520,7 +646,10 @@ async def run_burst_open(
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await registry.remove(key, session)
+        if normal_complete:
+            await registry.retire_if_complete(key, session)
+        elif not keep_session:
+            await registry.remove(key, session)
         await tunnel.close()
 
 
@@ -551,7 +680,8 @@ async def run_burst_upload(
     assert isinstance(fin, bool)
     assert isinstance(length, int)
 
-    session = await registry.get(burst_session_key(matched_secret, session_id))
+    key = burst_session_key(matched_secret, session_id)
+    session = await registry.get(key)
     await session.begin_upload()
     try:
         data = b""
@@ -578,6 +708,7 @@ async def run_burst_upload(
         )
     finally:
         await session.end_upload()
+        await registry.retire_if_complete(key, session)
         await tunnel.close()
 
 
@@ -604,7 +735,8 @@ async def run_burst_download(
     assert isinstance(sequence, int)
     assert isinstance(max_length, int)
 
-    session = await registry.get(burst_session_key(matched_secret, session_id))
+    key = burst_session_key(matched_secret, session_id)
+    session = await registry.get(key)
     await session.begin_download()
     try:
         status, next_sequence, data, fin = await session.read_download(
@@ -627,6 +759,7 @@ async def run_burst_download(
             await tunnel.send_binary(pack_envelope(data))
     finally:
         await session.end_download()
+        await registry.retire_if_complete(key, session)
         await tunnel.close()
 
 

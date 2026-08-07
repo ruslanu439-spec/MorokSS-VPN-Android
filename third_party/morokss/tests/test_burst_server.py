@@ -246,6 +246,14 @@ class BurstSessionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ProtocolError):
             await session.read_download(2, 8192)
 
+    async def test_future_download_waits_for_earlier_parallel_poll(self) -> None:
+        session = BurstSession(ChunkReader(b"A", b"B"), FakeWriter())
+        second = asyncio.create_task(session.read_download(1, 1))
+        await asyncio.sleep(0)
+        self.assertFalse(second.done())
+        self.assertEqual(("written", 1, b"A", False), await session.read_download(0, 1))
+        self.assertEqual(("written", 2, b"B", False), await second)
+
 
 class BurstRegistryTests(unittest.IsolatedAsyncioTestCase):
     async def test_registry_scopes_session_id_by_secret_hash_and_caps_sessions(self) -> None:
@@ -473,7 +481,7 @@ class BurstFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("duplicate", decode_burst_json(retry.sent[0])["status"])
         self.assertEqual(b"reply", unpack_envelope(retry.sent[1]))
 
-    async def test_open_acknowledges_then_cleans_up_when_control_dies(self) -> None:
+    async def test_open_detaches_session_when_control_dies(self) -> None:
         # Use a separate registry because asyncSetUp already occupies this key.
         registry = BurstSessionRegistry()
         writer = FakeWriter()
@@ -490,9 +498,47 @@ class BurstFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("open", decode_burst_json(tunnel.sent[0])["status"])
         self.assertTrue(tunnel.closed)
+        self.assertFalse(writer.closed)
+        session = await registry.get(burst_session_key(SECRET, "a" * 32))
+        self.assertEqual(("written", 1, False), await session.submit(0, b"late", False))
+        self.assertEqual(b"late", bytes(writer.data))
+        await registry.close()
         self.assertTrue(writer.closed)
-        with self.assertRaises(ProtocolError):
-            await registry.get(burst_session_key(SECRET, "a" * 32))
+
+    async def test_probe_backend_echoes_after_control_detaches(self) -> None:
+        registry = BurstSessionRegistry()
+        session_id = "d" * 32
+        key = burst_session_key(SECRET, session_id)
+        tunnel = FakeTunnel(
+            burst_json(version=1, session_id=session_id, probe=True)
+        )
+        with mock.patch(
+            "morokss.server.asyncio.open_connection",
+            new=asyncio.streams.open_connection,
+        ):
+            await asyncio.wait_for(
+                run_burst_open(tunnel, registry, SECRET, ("127.0.0.1", 1)),
+                timeout=3,
+            )
+
+        session = await registry.get(key)
+        self.assertEqual(
+            ("written", 1, False),
+            await asyncio.wait_for(session.submit(0, b"probe", False), timeout=2),
+        )
+        self.assertEqual(
+            ("written", 2, True),
+            await asyncio.wait_for(session.submit(1, b"", True), timeout=2),
+        )
+        self.assertEqual(
+            ("written", 1, b"probe", False),
+            await asyncio.wait_for(session.read_download(0, 8192), timeout=7),
+        )
+        self.assertEqual(
+            ("written", 2, b"", True),
+            await asyncio.wait_for(session.read_download(1, 8192), timeout=7),
+        )
+        await asyncio.wait_for(registry.close(), timeout=5)
 
     async def test_download_poll_observes_eof_and_control_waits_for_upload_fin(self) -> None:
         registry = BurstSessionRegistry()
@@ -529,10 +575,12 @@ class BurstFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(tunnel.closed)
         self.assertEqual(1, writer.eof_count)
-        with self.assertRaises(ProtocolError):
-            await registry.get(key)
+        retained = await registry.get(key)
+        self.assertTrue(retained.cleanup_scheduled)
+        await registry.close()
+        self.assertTrue(writer.closed)
 
-    async def test_http_physical_eof_cleans_control_without_waiting_for_fin(self) -> None:
+    async def test_http_physical_eof_detaches_control_without_waiting_for_fin(self) -> None:
         registry = BurstSessionRegistry()
         writer = FakeWriter()
         session_id = "c" * 32
@@ -553,9 +601,10 @@ class BurstFlowTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(tunnel.closed)
+        self.assertFalse(writer.closed)
+        self.assertIsNotNone(await registry.get(key))
+        await registry.close()
         self.assertTrue(writer.closed)
-        with self.assertRaises(ProtocolError):
-            await registry.get(key)
 
 
 if __name__ == "__main__":

@@ -15,23 +15,25 @@ import (
 )
 
 const (
-	minBurstChunk        = 1024
-	maxBurstChunk        = 8192
-	defaultBurstChunk    = 1024
-	minBurstParallel     = 1
-	maxBurstParallel     = 8
-	defaultBurstParallel = 8
-	burstUploadAttempts  = 3
-	burstAttemptTimeout  = 75 * time.Second
-	burstResponseTimeout = 65 * time.Second
-	burstCoalesceDelay   = 15 * time.Millisecond
-	burstDownloadChunk   = 8 * 1024
-	burstDownloadIdle    = 50 * time.Millisecond
+	minBurstChunk         = 1024
+	maxBurstChunk         = 8192
+	defaultBurstChunk     = 1024
+	minBurstParallel      = 1
+	maxBurstParallel      = 8
+	defaultBurstParallel  = 8
+	burstUploadAttempts   = 3
+	burstAttemptTimeout   = 20 * time.Second
+	burstResponseTimeout  = 15 * time.Second
+	burstCoalesceDelay    = 15 * time.Millisecond
+	burstDownloadChunk    = 8 * 1024
+	burstDownloadParallel = 8
+	burstDownloadIdle     = 50 * time.Millisecond
 )
 
 type burstOpenRequest struct {
 	Version   int    `json:"version"`
 	SessionID string `json:"session_id"`
+	Probe     bool   `json:"probe,omitempty"`
 }
 
 type burstOpenAck struct {
@@ -79,6 +81,12 @@ type burstDownloadResult struct {
 	data []byte
 	fin  bool
 	idle bool
+}
+
+type burstDownloadOutcome struct {
+	sequence uint64
+	result   burstDownloadResult
+	err      error
 }
 
 type burstRoute struct {
@@ -184,7 +192,11 @@ func receiveBurstJSON(ctx context.Context, tunnel tunnelStream, value any) error
 }
 
 func openBurstSession(ctx context.Context, tunnel tunnelStream, sessionID string) error {
-	request := burstOpenRequest{Version: 1, SessionID: sessionID}
+	return openBurstSessionMode(ctx, tunnel, sessionID, false)
+}
+
+func openBurstSessionMode(ctx context.Context, tunnel tunnelStream, sessionID string, probe bool) error {
+	request := burstOpenRequest{Version: 1, SessionID: sessionID, Probe: probe}
 	if err := sendBurstJSON(tunnel, request); err != nil {
 		return atStage(stageAuth, err)
 	}
@@ -278,41 +290,110 @@ func handleBurstLocal(ctx context.Context, local net.Conn, config clientConfig, 
 }
 
 func relayBurstDownload(ctx context.Context, route burstRoute, sessionID string, local net.Conn) error {
-	sequence := uint64(0)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
+	downloadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	outcomes := make(chan burstDownloadOutcome, burstDownloadParallel*2)
+	retryReady := make(chan uint64, burstDownloadParallel)
+	inflight := make(map[uint64]bool, burstDownloadParallel)
+	scheduled := make(map[uint64]bool, burstDownloadParallel)
+	pending := make(map[uint64]burstDownloadOutcome, burstDownloadParallel)
+	var workers sync.WaitGroup
+
+	launch := func(sequence uint64) {
+		if inflight[sequence] {
+			return
 		}
-		result, err := downloadBurstChunkWithRetry(ctx, route, sessionID, sequence)
-		if err != nil {
-			return err
+		inflight[sequence] = true
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			result, err := downloadBurstChunkWithRetry(downloadCtx, route, sessionID, sequence)
+			select {
+			case outcomes <- burstDownloadOutcome{sequence: sequence, result: result, err: err}:
+			case <-downloadCtx.Done():
+			}
+		}()
+	}
+	scheduleRetry := func(sequence uint64) {
+		if scheduled[sequence] {
+			return
 		}
-		if result.idle {
+		scheduled[sequence] = true
+		go func() {
 			timer := time.NewTimer(burstDownloadIdle)
+			defer timer.Stop()
 			select {
 			case <-timer.C:
-				continue
-			case <-ctx.Done():
-				if !timer.Stop() {
-					<-timer.C
+				select {
+				case retryReady <- sequence:
+				case <-downloadCtx.Done():
 				}
-				return ctx.Err()
+			case <-downloadCtx.Done():
 			}
+		}()
+	}
+	defer func() {
+		cancel()
+		workers.Wait()
+	}()
+
+	nextRequest := uint64(0)
+	nextWrite := uint64(0)
+	fillWindow := func() {
+		for nextRequest < nextWrite+burstDownloadParallel {
+			launch(nextRequest)
+			nextRequest++
 		}
-		if len(result.data) > 0 {
-			if err := writeAll(local, result.data); err != nil {
-				return atStage(stageTraffic, fmt.Errorf("write burst download: %w", err))
-			}
-		}
-		sequence++
-		if result.fin {
-			if closer, ok := local.(interface{ CloseWrite() error }); ok {
-				if err := closer.CloseWrite(); err != nil && !errors.Is(err, net.ErrClosed) {
-					return atStage(stageTraffic, fmt.Errorf("finish burst download: %w", err))
+	}
+	fillWindow()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case sequence := <-retryReady:
+			delete(scheduled, sequence)
+			if sequence >= nextWrite {
+				if _, complete := pending[sequence]; !complete {
+					launch(sequence)
 				}
 			}
-			return nil
+		case outcome := <-outcomes:
+			delete(inflight, outcome.sequence)
+			if outcome.err != nil {
+				pending[outcome.sequence] = outcome
+			} else if outcome.result.idle {
+				scheduleRetry(outcome.sequence)
+			} else {
+				pending[outcome.sequence] = outcome
+			}
 		}
+
+		for {
+			outcome, ready := pending[nextWrite]
+			if !ready {
+				break
+			}
+			delete(pending, nextWrite)
+			if outcome.err != nil {
+				return outcome.err
+			}
+			if len(outcome.result.data) > 0 {
+				if err := writeAll(local, outcome.result.data); err != nil {
+					return atStage(stageTraffic, fmt.Errorf("write burst download: %w", err))
+				}
+			}
+			nextWrite++
+			if outcome.result.fin {
+				if closer, ok := local.(interface{ CloseWrite() error }); ok {
+					if err := closer.CloseWrite(); err != nil && !errors.Is(err, net.ErrClosed) {
+						return atStage(stageTraffic, fmt.Errorf("finish burst download: %w", err))
+					}
+				}
+				return nil
+			}
+		}
+		fillWindow()
 	}
 }
 
@@ -385,7 +466,7 @@ func downloadBurstChunk(ctx context.Context, route burstRoute, sessionID string,
 
 func validateBurstDownloadAck(ack burstDownloadAck, sequence uint64) (bool, error) {
 	if ack.Status == "idle" {
-		if ack.NextSequence != sequence || ack.Length != 0 || ack.Fin {
+		if ack.NextSequence > sequence || ack.Length != 0 || ack.Fin {
 			return false, errors.New("invalid idle burst download acknowledgement")
 		}
 		return true, nil

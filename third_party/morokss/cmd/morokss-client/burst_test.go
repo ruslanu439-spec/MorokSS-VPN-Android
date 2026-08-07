@@ -235,6 +235,12 @@ func TestBurstDownloadAckInvariants(t *testing.T) {
 	if err != nil || !idle {
 		t.Fatalf("valid idle acknowledgement was rejected: idle=%v err=%v", idle, err)
 	}
+	idle, err = validateBurstDownloadAck(burstDownloadAck{
+		Status: "idle", NextSequence: 1,
+	}, 3)
+	if err != nil || !idle {
+		t.Fatalf("valid future-poll idle acknowledgement was rejected: idle=%v err=%v", idle, err)
+	}
 	for _, ack := range []burstDownloadAck{
 		{Status: "written", NextSequence: 4, Length: 1024},
 		{Status: "duplicate", NextSequence: 6, Length: 512},

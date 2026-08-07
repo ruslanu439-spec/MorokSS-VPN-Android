@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	clientVersion = "0.4.0-alpha9"
+	clientVersion = "0.4.0-alpha10"
 	diagnosticAll = "all"
 )
 
@@ -103,13 +103,26 @@ type clampDirectionResult struct {
 }
 
 type flowLimitDiagnostic struct {
-	Status               string                `json:"status"`
-	Classification       string                `json:"classification"`
-	Selected             *diagnosticSelection  `json:"selected,omitempty"`
-	Baseline             clampTrial            `json:"baseline"`
-	Upload               *clampDirectionResult `json:"upload,omitempty"`
-	Download             *clampDirectionResult `json:"download,omitempty"`
-	PathCharacterization *pathCharacterization `json:"path_characterization,omitempty"`
+	Status               string                  `json:"status"`
+	Classification       string                  `json:"classification"`
+	Selected             *diagnosticSelection    `json:"selected,omitempty"`
+	Baseline             clampTrial              `json:"baseline"`
+	Upload               *clampDirectionResult   `json:"upload,omitempty"`
+	Download             *clampDirectionResult   `json:"download,omitempty"`
+	PathCharacterization *pathCharacterization   `json:"path_characterization,omitempty"`
+	BurstRuntime         *burstRuntimeDiagnostic `json:"burst_runtime,omitempty"`
+}
+
+type burstRuntimeDiagnostic struct {
+	Status          string `json:"status"`
+	Stage           string `json:"stage"`
+	ErrorCode       string `json:"error_code,omitempty"`
+	ControlDetached bool   `json:"control_detached"`
+	UploadBytes     int    `json:"upload_bytes"`
+	DownloadBytes   int    `json:"download_bytes"`
+	UploadFlows     int    `json:"upload_flows"`
+	DownloadFlows   int    `json:"download_flows"`
+	DurationMS      int64  `json:"duration_ms"`
 }
 
 type pathCharacterization struct {
@@ -201,7 +214,7 @@ func supportedDiagnosticNetwork(value string) bool {
 
 func runDiagnostics(ctx context.Context, config clientConfig, tcpPool, udpPool *endpointPool, network string, includeEndpoints bool) (diagnosticReport, bool) {
 	report := diagnosticReport{
-		SchemaVersion: 3,
+		SchemaVersion: 4,
 		ClientVersion: clientVersion,
 		GeneratedAt:   time.Now().UTC(),
 		BurstUpload: diagnosticBurstConfig{
@@ -261,6 +274,123 @@ func runFlowLimitDiagnostic(ctx context.Context, config clientConfig, pool *endp
 	result.Classification = classifyFlowLimit(*result.Upload, *result.Download)
 	characterization := runPathCharacterization(ctx, config, target, *result.Upload, *result.Download)
 	result.PathCharacterization = &characterization
+	if config.burstUpload && ctx.Err() == nil {
+		burstRuntime := runBurstRuntimeDiagnostic(ctx, config, target)
+		result.BurstRuntime = &burstRuntime
+	}
+	return result
+}
+
+func runBurstRuntimeDiagnostic(ctx context.Context, config clientConfig, target clampTarget) burstRuntimeDiagnostic {
+	const payloadBytes = 8 * 1024
+	started := time.Now()
+	result := burstRuntimeDiagnostic{
+		Status:      "failed",
+		Stage:       "connecting",
+		UploadBytes: payloadBytes,
+	}
+	fail := func(err error) burstRuntimeDiagnostic {
+		result.Stage = diagnosticStage(err)
+		result.ErrorCode = diagnosticErrorCode(err)
+		result.DurationMS = time.Since(started).Milliseconds()
+		return result
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	current := config
+	current.server = target.endpoint.Address
+	current.hostname = target.endpoint.Hostname
+	current.tlsSNI = target.tlsSNI
+	current.endpointIndex = target.index
+	current.profile = target.profile
+	current.transport = target.transport
+	current.network = networkBurstOpen
+	current.diagnostics = nil
+	control, err := openTunnelWithProfile(probeCtx, current, target.profile)
+	if err != nil {
+		return fail(err)
+	}
+
+	sessionID, err := newBurstSessionID(rand.Reader)
+	if err != nil {
+		control.close()
+		return fail(err)
+	}
+	if err := openBurstSessionMode(probeCtx, control, sessionID, true); err != nil {
+		control.close()
+		return fail(err)
+	}
+	routeConfig := current
+	routeConfig.network = networkBurstUpload
+	route := burstRoute{config: routeConfig, profile: target.profile}
+	control.close()
+	result.ControlDetached = true
+	select {
+	case <-time.After(300 * time.Millisecond):
+	case <-probeCtx.Done():
+		return fail(probeCtx.Err())
+	}
+
+	payload := make([]byte, payloadBytes)
+	if _, err := io.ReadFull(rand.Reader, payload); err != nil {
+		return fail(err)
+	}
+	chunkSize := config.burstChunk
+	chunkCount := (len(payload) + chunkSize - 1) / chunkSize
+	errorsByFlow := make(chan error, chunkCount)
+	var uploads sync.WaitGroup
+	for sequence := 0; sequence < chunkCount; sequence++ {
+		start := sequence * chunkSize
+		end := min(start+chunkSize, len(payload))
+		data := append([]byte(nil), payload[start:end]...)
+		uploads.Add(1)
+		go func(sequence uint64, data []byte) {
+			defer uploads.Done()
+			errorsByFlow <- uploadBurstChunkWithRetry(probeCtx, route, sessionID, sequence, data, false)
+		}(uint64(sequence), data)
+	}
+	uploads.Wait()
+	close(errorsByFlow)
+	result.UploadFlows = chunkCount + 1
+	for uploadErr := range errorsByFlow {
+		if uploadErr != nil {
+			return fail(uploadErr)
+		}
+	}
+	if err := uploadBurstChunkWithRetry(probeCtx, route, sessionID, uint64(chunkCount), nil, true); err != nil {
+		return fail(err)
+	}
+
+	received := make([]byte, 0, len(payload))
+	sequence := uint64(0)
+	for {
+		download, err := downloadBurstChunkWithRetry(probeCtx, route, sessionID, sequence)
+		result.DownloadFlows++
+		if err != nil {
+			return fail(err)
+		}
+		if download.idle {
+			continue
+		}
+		received = append(received, download.data...)
+		sequence++
+		if len(received) > len(payload)+burstDownloadChunk {
+			return fail(atStage(stageTraffic, errors.New("burst probe returned excess data")))
+		}
+		if download.fin {
+			break
+		}
+	}
+	result.DownloadBytes = len(received)
+	wantHash := sha256.Sum256(payload)
+	gotHash := sha256.Sum256(received)
+	if wantHash != gotHash {
+		return fail(atStage(stageTraffic, errors.New("burst probe hash mismatch")))
+	}
+	result.Status = "complete"
+	result.Stage = "complete"
+	result.DurationMS = time.Since(started).Milliseconds()
 	return result
 }
 
