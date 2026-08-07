@@ -168,6 +168,7 @@ data class Profile(
 
             private fun tryParseMorokss(json: JSONObject): Profile? {
                 val shadowsocks = json.optJSONObject("shadowsocks") ?: return null
+                val displayName = json.optString("name").trim()
                 val secret = json.optString("morokss_secret")
                 val hostname = json.optString("hostname")
                 val endpoint = json.optString("endpoint")
@@ -220,7 +221,8 @@ data class Profile(
                         options["cover_sni"] = it
                     }
                     plugin = options.toString(false)
-                    if (name.isNullOrEmpty()) name = "MorokSS"
+                    if (displayName.isNotEmpty()) name = displayName
+                    else if (name.isNullOrEmpty()) name = "MorokSS"
                 }
             }
 

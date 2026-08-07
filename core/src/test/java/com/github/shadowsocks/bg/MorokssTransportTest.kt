@@ -25,9 +25,9 @@ class MorokssTransportTest {
         assertEquals("auto", transport.tlsProfile)
         assertEquals("auto", transport.wireTransport)
         assertEquals("auto", transport.coverSniMode)
-        assertEquals(false, transport.burstUpload)
-        assertEquals(4096, transport.burstChunk)
-        assertEquals(2, transport.burstParallel)
+        assertTrue(transport.burstUpload)
+        assertEquals(8192, transport.burstChunk)
+        assertEquals(4, transport.burstParallel)
         assertTrue(transport.insecure)
         assertEquals(listOf("one.example.com", "two.example.com"), transport.coverSnis)
         assertEquals(listOf(
@@ -54,6 +54,19 @@ class MorokssTransportTest {
         assertTrue(transport.burstUpload)
         assertEquals(4096, transport.burstChunk)
         assertEquals(2, transport.burstParallel)
+    }
+
+    @Test
+    fun allowsBurstUploadToBeExplicitlyDisabled() {
+        val options = PluginOptions(MorokssPlugin.ID, null).apply {
+            put("hostname", "vpn.example.com")
+            put("secret", "0123456789abcdef0123456789abcdef")
+            put("endpoint", "edge.example.com:443")
+            put("burst_upload", "false")
+        }
+        val transport = MorokssTransport.from(Profile(plugin = options.toString(false)))!!
+
+        assertEquals(false, transport.burstUpload)
     }
 
     @Test

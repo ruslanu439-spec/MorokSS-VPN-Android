@@ -57,13 +57,17 @@ data class MorokssTransport(
             require(manifestSources.isEmpty() == manifestPublicKey.isEmpty()) {
                 "MorokSS: endpoint_manifest and manifest_public_key must be set together"
             }
-            val burstUpload = options["burst_upload"].equals("true", ignoreCase = true)
-            val burstChunk = options["burst_chunk"].orEmpty().ifBlank { "4096" }.toIntOrNull()
+            // Existing MorokSS profiles predate Burst and therefore have no option at all.
+            // Enable it by default so an app update also fixes those saved profiles; an
+            // explicit false remains available for troubleshooting and rollback.
+            val burstUpload = options["burst_upload"].orEmpty().ifBlank { "true" }
+                    .equals("true", ignoreCase = true)
+            val burstChunk = options["burst_chunk"].orEmpty().ifBlank { "8192" }.toIntOrNull()
                     ?: throw IllegalArgumentException("MorokSS: burst_chunk must be an integer")
             require(burstChunk in 1024..8192) {
                 "MorokSS: burst_chunk must be between 1024 and 8192 bytes"
             }
-            val burstParallel = options["burst_parallel"].orEmpty().ifBlank { "2" }.toIntOrNull()
+            val burstParallel = options["burst_parallel"].orEmpty().ifBlank { "4" }.toIntOrNull()
                     ?: throw IllegalArgumentException("MorokSS: burst_parallel must be an integer")
             require(burstParallel in 1..8) {
                 "MorokSS: burst_parallel must be between 1 and 8"
