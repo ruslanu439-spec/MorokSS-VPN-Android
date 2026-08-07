@@ -28,8 +28,8 @@ SECRET = b"burst-e2e-test-secret-that-is-longer-than-thirty-two-bytes"
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUN_GO_TESTS = os.environ.get("MOROKSS_RUN_GO_TESTS") == "1"
 FLOW_BUDGET = 16 * 1024
-BURST_CHUNK = 8 * 1024
-PAYLOAD_SIZE = 8 * 1024 * 1024
+BURST_CHUNK = int(os.environ.get("MOROKSS_BURST_E2E_CHUNK", 8 * 1024))
+PAYLOAD_SIZE = int(os.environ.get("MOROKSS_BURST_E2E_BYTES", 8 * 1024 * 1024))
 WIRE_TRANSPORT = os.environ.get("MOROKSS_BURST_E2E_TRANSPORT", "websocket")
 
 
@@ -37,13 +37,15 @@ WIRE_TRANSPORT = os.environ.get("MOROKSS_BURST_E2E_TRANSPORT", "websocket")
 class FlowObservation:
     index: int
     client_bytes: int = 0
+    server_bytes: int = 0
     clamped: bool = False
+    server_clamped: bool = False
     injected_drop: bool = False
     discarded_server_bytes: int = 0
 
 
 class DirectionalClampProxy:
-    """A byte-budget clamp for each client-to-server encrypted TCP flow."""
+    """A bidirectional byte-budget clamp for every encrypted TCP flow."""
 
     def __init__(self, target: tuple[str, int], budget: int) -> None:
         self.target = target
@@ -51,6 +53,7 @@ class DirectionalClampProxy:
         self.flows: list[FlowObservation] = []
         self.tasks: set[asyncio.Task[object]] = set()
         self.injected_ack = asyncio.Event()
+        self.claimed_ack = False
         self.server: asyncio.AbstractServer | None = None
 
     async def start(self) -> int:
@@ -89,11 +92,6 @@ class DirectionalClampProxy:
         try:
             server_reader, server_writer = await asyncio.open_connection(*self.target)
             suppress_download = asyncio.Event()
-            # The first accepted flow is the persistent burst control. Every later
-            # flow is an upload. Drop the first upload only after its request has
-            # grown beyond the handshake/auth/header prefix and the server replies.
-            inject_this_flow = flow.index == 1
-
             async def client_to_server() -> None:
                 nonlocal server_writer
                 assert server_writer is not None
@@ -104,24 +102,31 @@ class DirectionalClampProxy:
                         return
 
                     trigger_lost_ack = (
-                        inject_this_flow
+                        flow.index > 0
+                        and not self.claimed_ack
                         and flow.client_bytes + len(record) >= 4 * 1024
                     )
                     flow.client_bytes += len(record)
                     if trigger_lost_ack:
+                        self.claimed_ack = True
                         suppress_download.set()
                     server_writer.write(record)
                     await server_writer.drain()
-                    if self.injected_ack.is_set() and inject_this_flow:
+                    if flow.injected_drop:
                         return
 
             async def server_to_client() -> None:
-                while data := await server_reader.read(64 * 1024):
+                while True:
+                    data = await self.read_tls_record(server_reader)
                     if suppress_download.is_set():
                         flow.discarded_server_bytes += len(data)
                         flow.injected_drop = True
                         self.injected_ack.set()
                         return
+                    if flow.server_bytes + len(data) > self.budget:
+                        flow.server_clamped = True
+                        return
+                    flow.server_bytes += len(data)
                     client_writer.write(data)
                     await client_writer.drain()
 
@@ -360,7 +365,9 @@ class BurstEndToEndTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "index": flow.index,
                             "client_bytes": flow.client_bytes,
+                            "server_bytes": flow.server_bytes,
                             "clamped": flow.clamped,
+                            "server_clamped": flow.server_clamped,
                             "injected_drop": flow.injected_drop,
                             "discarded_server_bytes": flow.discarded_server_bytes,
                         }
@@ -378,20 +385,37 @@ class BurstEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(echoed, payload)
 
-                upload_flows = proxy.flows[1:]
-                injected = [flow for flow in upload_flows if flow.injected_drop]
+                data_flows = proxy.flows[1:]
+                injected = [flow for flow in data_flows if flow.injected_drop]
                 self.assertEqual(len(injected), 1)
                 self.assertGreater(injected[0].discarded_server_bytes, 0)
-                intact_uploads = [flow for flow in upload_flows if not flow.injected_drop]
-                self.assertGreaterEqual(len(intact_uploads), PAYLOAD_SIZE // BURST_CHUNK)
-                self.assertTrue(intact_uploads)
+                intact_flows = [flow for flow in data_flows if not flow.injected_drop]
+                self.assertGreaterEqual(
+                    len(intact_flows),
+                    PAYLOAD_SIZE // BURST_CHUNK
+                    + PAYLOAD_SIZE // (8 * 1024),
+                )
+                self.assertTrue(intact_flows)
                 self.assertTrue(
                     all(
-                        not flow.clamped and flow.client_bytes <= FLOW_BUDGET
-                        for flow in intact_uploads
-                    )
+                        flow.client_bytes <= FLOW_BUDGET
+                        and flow.server_bytes <= FLOW_BUDGET
+                        for flow in intact_flows
+                    ),
+                    [
+                        {
+                            "index": flow.index,
+                            "client_bytes": flow.client_bytes,
+                            "server_bytes": flow.server_bytes,
+                            "clamped": flow.clamped,
+                            "server_clamped": flow.server_clamped,
+                            "injected_drop": flow.injected_drop,
+                        }
+                        for flow in intact_flows
+                        if flow.client_bytes > FLOW_BUDGET
+                        or flow.server_bytes > FLOW_BUDGET
+                    ],
                 )
-                self.assertFalse(any(flow.clamped for flow in proxy.flows))
 
                 local_writer.close()
                 with contextlib.suppress(OSError, asyncio.TimeoutError):

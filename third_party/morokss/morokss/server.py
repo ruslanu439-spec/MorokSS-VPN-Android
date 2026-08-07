@@ -43,6 +43,8 @@ BURST_MAX_SESSIONS_PER_SECRET = 64
 BURST_MAX_ACTIVE_UPLOADS = 8
 BURST_IDLE_TIMEOUT = 10 * 60.0
 BURST_COMPLETED_WINDOW = 128
+BURST_DOWNLOAD_WINDOW = 8
+BURST_DOWNLOAD_WAIT = 20.0
 BURST_CONNECTIONS_PER_MINUTE = 2_400
 BURST_ACTIVE_CONNECTIONS_PER_SECRET = 64
 BURST_IO_TIMEOUT = 15.0
@@ -52,7 +54,7 @@ BURST_PAYLOAD_TIMEOUT = 60.0
 
 @dataclass
 class BurstSession:
-    """One backend stream shared by a control flow and short upload flows."""
+    """One backend stream shared by control and short bidirectional flows."""
 
     backend_reader: asyncio.StreamReader
     backend_writer: asyncio.StreamWriter
@@ -64,6 +66,7 @@ class BurstSession:
     next_sequence: int = 0
     pending_bytes: int = 0
     active_uploads: int = 0
+    active_downloads: int = 0
     fin_sequence: int | None = None
     fin_written: bool = False
     download_finished: bool = False
@@ -73,15 +76,25 @@ class BurstSession:
     completed: OrderedDict[int, tuple[int, bytes, bool]] = field(
         default_factory=OrderedDict
     )
+    download_next_sequence: int = 0
+    download_completed: OrderedDict[int, tuple[bytes, bool]] = field(
+        default_factory=OrderedDict
+    )
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    download_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     upload_finished: asyncio.Event = field(default_factory=asyncio.Event)
+    download_finished_event: asyncio.Event = field(default_factory=asyncio.Event)
     last_activity: float = field(default_factory=time.monotonic)
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
 
     def idle_at(self, now: float, timeout: float) -> bool:
-        return self.active_uploads == 0 and now - self.last_activity >= timeout
+        return (
+            self.active_uploads == 0
+            and self.active_downloads == 0
+            and now - self.last_activity >= timeout
+        )
 
     async def begin_upload(self) -> None:
         async with self.lock:
@@ -96,6 +109,62 @@ class BurstSession:
         async with self.lock:
             self.active_uploads = max(0, self.active_uploads - 1)
             self.touch()
+
+    async def begin_download(self) -> None:
+        async with self.lock:
+            if self.closed:
+                raise ProtocolError("burst session is closed")
+            self.active_downloads += 1
+            self.touch()
+
+    async def end_download(self) -> None:
+        async with self.lock:
+            self.active_downloads = max(0, self.active_downloads - 1)
+            self.touch()
+
+    async def read_download(
+        self, sequence: int, max_length: int
+    ) -> tuple[str, int, bytes, bool]:
+        """Return one retry-safe backend chunk for a client-initiated poll."""
+        async with self.download_lock:
+            if self.closed:
+                raise ProtocolError("burst session is closed")
+            if not 1 <= max_length <= BURST_MAX_DATA:
+                raise ProtocolError("invalid burst download length")
+            if sequence < self.download_next_sequence:
+                cached = self.download_completed.get(sequence)
+                if cached is None:
+                    raise ProtocolError("burst download retry is too old")
+                self.touch()
+                data, fin = cached
+                return "duplicate", self.download_next_sequence, data, fin
+            if sequence > self.download_next_sequence:
+                raise ProtocolError("burst download sequence is too far ahead")
+            if self.download_finished:
+                raise ProtocolError("burst download is already finished")
+
+            try:
+                data = await asyncio.wait_for(
+                    self.backend_reader.read(max_length), BURST_DOWNLOAD_WAIT
+                )
+            except asyncio.TimeoutError:
+                self.touch()
+                return "idle", self.download_next_sequence, b"", False
+            except (ConnectionError, OSError):
+                async with self.lock:
+                    self._fail_locked()
+                raise
+
+            fin = not data
+            self.download_completed[sequence] = (data, fin)
+            while len(self.download_completed) > BURST_DOWNLOAD_WINDOW:
+                self.download_completed.popitem(last=False)
+            self.download_next_sequence += 1
+            if fin:
+                self.download_finished = True
+                self.download_finished_event.set()
+            self.touch()
+            return "written", self.download_next_sequence, data, fin
 
     async def submit(
         self, sequence: int, data: bytes, fin: bool
@@ -192,6 +261,7 @@ class BurstSession:
         self.pending.clear()
         self.pending_bytes = 0
         self.upload_finished.set()
+        self.download_finished_event.set()
         self.backend_writer.close()
 
     async def close(self) -> None:
@@ -199,7 +269,9 @@ class BurstSession:
             self.closed = True
             self.pending.clear()
             self.pending_bytes = 0
+            self.download_completed.clear()
             self.upload_finished.set()
+            self.download_finished_event.set()
             if not self.backend_writer.is_closing():
                 self.backend_writer.close()
         with contextlib.suppress(ConnectionError, asyncio.TimeoutError):
@@ -387,18 +459,6 @@ async def run_burst_open(
     session = await registry.open(key, backend)
     tasks: set[asyncio.Task[object]] = set()
 
-    async def backend_to_control() -> None:
-        while data := await session.backend_reader.read(8 * 1024):
-            session.touch()
-            await tunnel.send_binary(pack_envelope(data))
-        if session.failed:
-            raise ConnectionError("burst backend upload failed")
-        session.download_finished = True
-        session.touch()
-        # An empty envelope after the open acknowledgement is an explicit
-        # downstream FIN. The backend write side remains alive for late uploads.
-        await tunnel.send_binary(pack_envelope(b""))
-
     async def watch_control() -> bool:
         # Upload data belongs on burst-upload flows. Reading here exists only to
         # promptly detect a closed control flow and release the backend session.
@@ -429,10 +489,12 @@ async def run_burst_open(
                 "status": "open",
             },
         )
-        backend_task = asyncio.create_task(backend_to_control())
         control_task = asyncio.create_task(watch_control())
         upload_fin_task = asyncio.create_task(session.upload_finished.wait())
-        tasks = {backend_task, control_task, upload_fin_task}
+        download_fin_task = asyncio.create_task(session.download_finished_event.wait())
+        tasks = {control_task, upload_fin_task, download_fin_task}
+        upload_done = False
+        download_done = False
         while True:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             if control_task in done:
@@ -441,17 +503,18 @@ async def run_burst_open(
                 if control_dead:
                     break
                 # HTTP request half-close: the response and backend stay live.
-            if backend_task in done:
-                backend_task.result()
             if upload_fin_task in done:
                 upload_fin_task.result()
-                if session.failed:
-                    break
-            if backend_task.done() and upload_fin_task.done():
+                upload_done = True
+                tasks.remove(upload_fin_task)
+            if download_fin_task in done:
+                download_fin_task.result()
+                download_done = True
+                tasks.remove(download_fin_task)
+            if session.failed or (upload_done and download_done):
                 break
             if not tasks:
                 break
-            tasks.difference_update(done)
     finally:
         for task in tasks:
             if not task.done():
@@ -515,6 +578,55 @@ async def run_burst_upload(
         )
     finally:
         await session.end_upload()
+        await tunnel.close()
+
+
+async def run_burst_download(
+    tunnel: WebSocketStream | HTTPChunkStream,
+    registry: BurstSessionRegistry,
+    matched_secret: bytes,
+) -> None:
+    request = await _receive_burst_json(tunnel)
+    session_id = request.get("session_id")
+    sequence = request.get("sequence")
+    max_length = request.get("max_length")
+    if (
+        type(request.get("version")) is not int
+        or request.get("version") != 1
+        or not _valid_burst_session_id(session_id)
+        or type(sequence) is not int
+        or sequence < 0
+        or type(max_length) is not int
+        or not 1 <= max_length <= BURST_MAX_DATA
+    ):
+        raise ProtocolError("invalid burst download request")
+    assert isinstance(session_id, str)
+    assert isinstance(sequence, int)
+    assert isinstance(max_length, int)
+
+    session = await registry.get(burst_session_key(matched_secret, session_id))
+    await session.begin_download()
+    try:
+        status, next_sequence, data, fin = await session.read_download(
+            sequence, max_length
+        )
+        await _send_burst_json(
+            tunnel,
+            {
+                "version": 1,
+                "session_id": session_id,
+                "sequence": sequence,
+                "status": status,
+                "next_sequence": next_sequence,
+                "length": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "fin": fin,
+            },
+        )
+        if data:
+            await tunnel.send_binary(pack_envelope(data))
+    finally:
+        await session.end_download()
         await tunnel.close()
 
 
@@ -940,7 +1052,15 @@ async def handle_client(
             and headers.get("content-type", "").lower()
             == "application/octet-stream"
             and headers.get("x-stream-network", "")
-            in {"tcp", "udp", "probe", "clamp", "burst-open", "burst-upload"}
+            in {
+                "tcp",
+                "udp",
+                "probe",
+                "clamp",
+                "burst-open",
+                "burst-upload",
+                "burst-download",
+            }
         )
         if not websocket_request and not http_stream_request:
             await relay_plain_http(reader, writer, raw_head, decoy)
@@ -957,6 +1077,9 @@ async def handle_client(
             elif "morokss.burst.upload.v1" in requested_protocols:
                 selected_protocol = "morokss.burst.upload.v1"
                 network_mode = "burst-upload"
+            elif "morokss.burst.download.v1" in requested_protocols:
+                selected_protocol = "morokss.burst.download.v1"
+                network_mode = "burst-download"
             elif "morokss.clamp.v1" in requested_protocols:
                 selected_protocol = "morokss.clamp.v1"
                 network_mode = "clamp"
@@ -1017,7 +1140,7 @@ async def handle_client(
             await run_clamp_probe(tunnel)
             return
 
-        if network_mode in {"burst-open", "burst-upload"}:
+        if network_mode in {"burst-open", "burst-upload", "burst-download"}:
             if burst_registry is None:
                 burst_registry = getattr(replay_cache, "_burst_registry", None)
                 if burst_registry is None:
@@ -1038,8 +1161,10 @@ async def handle_client(
                     await run_burst_open(
                         tunnel, burst_registry, matched_secret, backend
                     )
-                else:
+                elif network_mode == "burst-upload":
                     await run_burst_upload(tunnel, burst_registry, matched_secret)
+                else:
+                    await run_burst_download(tunnel, burst_registry, matched_secret)
             finally:
                 if burst_admission is not None:
                     await burst_admission.release(secret_scope)

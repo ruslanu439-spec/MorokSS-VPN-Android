@@ -228,16 +228,31 @@ func TestReadBurstChunkCoalescesSmallWrites(t *testing.T) {
 	}
 }
 
-func TestBurstDownloadEmptyEnvelopeHalfClosesLocal(t *testing.T) {
-	tunnel := &burstTestTunnel{received: [][]byte{
-		packedBurstTestData(t, []byte("reply")),
-		packedBurstTestData(t, nil),
-	}}
-	local := &burstLocalRecorder{}
-	if err := relayBurstDownload(context.Background(), tunnel, local); err != nil {
-		t.Fatal(err)
+func TestBurstDownloadAckInvariants(t *testing.T) {
+	idle, err := validateBurstDownloadAck(burstDownloadAck{
+		Status: "idle", NextSequence: 3,
+	}, 3)
+	if err != nil || !idle {
+		t.Fatalf("valid idle acknowledgement was rejected: idle=%v err=%v", idle, err)
 	}
-	if local.String() != "reply" || !local.writeClosed {
-		t.Fatalf("download FIN was not propagated: data=%q closed=%v", local.String(), local.writeClosed)
+	for _, ack := range []burstDownloadAck{
+		{Status: "written", NextSequence: 4, Length: 1024},
+		{Status: "duplicate", NextSequence: 6, Length: 512},
+		{Status: "written", NextSequence: 4, Fin: true},
+	} {
+		idle, err := validateBurstDownloadAck(ack, 3)
+		if err != nil || idle {
+			t.Fatalf("valid acknowledgement was rejected: %#v idle=%v err=%v", ack, idle, err)
+		}
+	}
+	for _, ack := range []burstDownloadAck{
+		{Status: "idle", NextSequence: 4},
+		{Status: "written", NextSequence: 3, Length: 1},
+		{Status: "written", NextSequence: 4, Length: 1, Fin: true},
+		{Status: "rejected", NextSequence: 4},
+	} {
+		if _, err := validateBurstDownloadAck(ack, 3); err == nil {
+			t.Fatalf("invalid acknowledgement was accepted: %#v", ack)
+		}
 	}
 }

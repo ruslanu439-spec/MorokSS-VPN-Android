@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,8 @@ const (
 	burstAttemptTimeout  = 75 * time.Second
 	burstResponseTimeout = 65 * time.Second
 	burstCoalesceDelay   = 15 * time.Millisecond
+	burstDownloadChunk   = 8 * 1024
+	burstDownloadIdle    = 50 * time.Millisecond
 )
 
 type burstOpenRequest struct {
@@ -52,6 +55,30 @@ type burstUploadAck struct {
 	Status       string `json:"status"`
 	NextSequence uint64 `json:"next_sequence"`
 	Fin          bool   `json:"fin"`
+}
+
+type burstDownloadRequest struct {
+	Version   int    `json:"version"`
+	SessionID string `json:"session_id"`
+	Sequence  uint64 `json:"sequence"`
+	MaxLength int    `json:"max_length"`
+}
+
+type burstDownloadAck struct {
+	Version      int    `json:"version"`
+	SessionID    string `json:"session_id"`
+	Sequence     uint64 `json:"sequence"`
+	Status       string `json:"status"`
+	NextSequence uint64 `json:"next_sequence"`
+	Length       int    `json:"length"`
+	SHA256       string `json:"sha256"`
+	Fin          bool   `json:"fin"`
+}
+
+type burstDownloadResult struct {
+	data []byte
+	fin  bool
+	idle bool
 }
 
 type burstRoute struct {
@@ -114,9 +141,9 @@ func sendBurstJSON(tunnel tunnelStream, value any) error {
 	return nil
 }
 
-func receiveBurstJSON(ctx context.Context, tunnel tunnelStream, value any) error {
+func receiveBurstFrame(ctx context.Context, tunnel tunnelStream) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	stop := make(chan struct{})
 	go func() {
@@ -134,13 +161,21 @@ func receiveBurstJSON(ctx context.Context, tunnel tunnelStream, value any) error
 	close(stop)
 	if err != nil {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
-		return fmt.Errorf("receive burst message: %w", err)
+		return nil, fmt.Errorf("receive burst message: %w", err)
 	}
 	data, err := unpackEnvelope(payload)
 	if err != nil {
-		return fmt.Errorf("unpack burst message: %w", err)
+		return nil, fmt.Errorf("unpack burst message: %w", err)
+	}
+	return data, nil
+}
+
+func receiveBurstJSON(ctx context.Context, tunnel tunnelStream, value any) error {
+	data, err := receiveBurstFrame(ctx, tunnel)
+	if err != nil {
+		return err
 	}
 	if err := json.Unmarshal(data, value); err != nil {
 		return fmt.Errorf("decode burst message: %w", err)
@@ -193,7 +228,7 @@ func handleBurstLocal(ctx context.Context, local net.Conn, config clientConfig, 
 		uploadDone <- runBurstUploads(connectionCtx, local, route, sessionID, config.burstChunk, config.burstParallel)
 	}()
 	go func() {
-		downloadDone <- relayBurstDownload(connectionCtx, control, local)
+		downloadDone <- relayBurstDownload(connectionCtx, route, sessionID, local)
 	}()
 
 	var uploadResult, downloadResult error
@@ -242,23 +277,35 @@ func handleBurstLocal(ctx context.Context, local net.Conn, config clientConfig, 
 	return nil
 }
 
-func relayBurstDownload(ctx context.Context, tunnel tunnelStream, local net.Conn) error {
+func relayBurstDownload(ctx context.Context, route burstRoute, sessionID string, local net.Conn) error {
+	sequence := uint64(0)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		payload, err := tunnel.receiveBinary()
+		result, err := downloadBurstChunkWithRetry(ctx, route, sessionID, sequence)
 		if err != nil {
-			if ctx.Err() != nil {
+			return err
+		}
+		if result.idle {
+			timer := time.NewTimer(burstDownloadIdle)
+			select {
+			case <-timer.C:
+				continue
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
 				return ctx.Err()
 			}
-			return atStage(stageTraffic, fmt.Errorf("burst download: %w", err))
 		}
-		data, err := unpackEnvelope(payload)
-		if err != nil {
-			return atStage(stageTraffic, fmt.Errorf("burst download: %w", err))
+		if len(result.data) > 0 {
+			if err := writeAll(local, result.data); err != nil {
+				return atStage(stageTraffic, fmt.Errorf("write burst download: %w", err))
+			}
 		}
-		if len(data) == 0 {
+		sequence++
+		if result.fin {
 			if closer, ok := local.(interface{ CloseWrite() error }); ok {
 				if err := closer.CloseWrite(); err != nil && !errors.Is(err, net.ErrClosed) {
 					return atStage(stageTraffic, fmt.Errorf("finish burst download: %w", err))
@@ -266,10 +313,95 @@ func relayBurstDownload(ctx context.Context, tunnel tunnelStream, local net.Conn
 			}
 			return nil
 		}
-		if err := writeAll(local, data); err != nil {
-			return atStage(stageTraffic, fmt.Errorf("write burst download: %w", err))
+	}
+}
+
+func downloadBurstChunkWithRetry(ctx context.Context, route burstRoute, sessionID string, sequence uint64) (burstDownloadResult, error) {
+	var attemptErrors []error
+	for attempt := 1; attempt <= burstUploadAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return burstDownloadResult{}, err
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, burstAttemptTimeout)
+		result, err := downloadBurstChunk(attemptCtx, route, sessionID, sequence)
+		cancel()
+		if err == nil {
+			return result, nil
+		}
+		attemptErrors = append(attemptErrors, fmt.Errorf("attempt %d: %w", attempt, err))
+		if attempt < burstUploadAttempts {
+			if err := waitBurstRetry(ctx, attempt); err != nil {
+				return burstDownloadResult{}, err
+			}
 		}
 	}
+	return burstDownloadResult{}, atStage(stageTraffic, fmt.Errorf("burst download sequence %d failed: %w", sequence, errors.Join(attemptErrors...)))
+}
+
+func downloadBurstChunk(ctx context.Context, route burstRoute, sessionID string, sequence uint64) (burstDownloadResult, error) {
+	current := route.config
+	current.network = networkBurstDownload
+	tunnel, err := openTunnelWithProfile(ctx, current, route.profile)
+	if err != nil {
+		return burstDownloadResult{}, err
+	}
+	defer tunnel.close()
+	request := burstDownloadRequest{
+		Version: 1, SessionID: sessionID, Sequence: sequence, MaxLength: burstDownloadChunk,
+	}
+	if err := sendBurstJSON(tunnel, request); err != nil {
+		return burstDownloadResult{}, err
+	}
+	var ack burstDownloadAck
+	if err := receiveBurstJSON(ctx, tunnel, &ack); err != nil {
+		return burstDownloadResult{}, err
+	}
+	if ack.Version != 1 || ack.SessionID != sessionID || ack.Sequence != sequence || ack.Length < 0 || ack.Length > burstDownloadChunk {
+		return burstDownloadResult{}, errors.New("invalid burst download acknowledgement")
+	}
+	idle, err := validateBurstDownloadAck(ack, sequence)
+	if err != nil {
+		return burstDownloadResult{}, err
+	}
+	if idle {
+		return burstDownloadResult{idle: true}, nil
+	}
+	data := []byte(nil)
+	if ack.Length > 0 {
+		data, err = receiveBurstFrame(ctx, tunnel)
+		if err != nil {
+			return burstDownloadResult{}, err
+		}
+		if len(data) != ack.Length {
+			return burstDownloadResult{}, errors.New("burst download length mismatch")
+		}
+	}
+	wantHash := hex.EncodeToString(sha256Sum(data))
+	if ack.SHA256 != wantHash {
+		return burstDownloadResult{}, errors.New("burst download hash mismatch")
+	}
+	return burstDownloadResult{data: data, fin: ack.Fin}, nil
+}
+
+func validateBurstDownloadAck(ack burstDownloadAck, sequence uint64) (bool, error) {
+	if ack.Status == "idle" {
+		if ack.NextSequence != sequence || ack.Length != 0 || ack.Fin {
+			return false, errors.New("invalid idle burst download acknowledgement")
+		}
+		return true, nil
+	}
+	if (ack.Status != "written" && ack.Status != "duplicate") || ack.NextSequence < sequence+1 {
+		return false, errors.New("burst download sequence was not acknowledged")
+	}
+	if ack.Fin && ack.Length != 0 {
+		return false, errors.New("burst download FIN contains data")
+	}
+	return false, nil
+}
+
+func sha256Sum(data []byte) []byte {
+	sum := sha256.Sum256(data)
+	return sum[:]
 }
 
 func runBurstUploads(ctx context.Context, local net.Conn, route burstRoute, sessionID string, chunkSize, parallel int) error {

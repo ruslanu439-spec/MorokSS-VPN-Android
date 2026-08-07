@@ -82,7 +82,7 @@ func main() {
 	flag.BoolVar(&diagnose, "diagnose", false, "test tunnel readiness and print a privacy-safe JSON report instead of starting local listeners")
 	flag.StringVar(&diagnoseNetwork, "diagnose-network", networkTCP, "network to test with --diagnose: tcp, udp, or all")
 	flag.BoolVar(&diagnoseIncludeEndpoints, "diagnose-include-endpoints", false, "include endpoint addresses and TLS hostnames in the diagnostic report")
-	flag.BoolVar(&config.burstUpload, "burst-upload", false, "split TCP uploads across fresh authenticated TLS connections")
+	flag.BoolVar(&config.burstUpload, "burst-upload", false, "split TCP traffic across fresh authenticated TLS connections")
 	flag.IntVar(&config.burstChunk, "burst-chunk", defaultBurstChunk, "burst upload payload bytes per connection (1024-8192)")
 	flag.IntVar(&config.burstParallel, "burst-parallel", defaultBurstParallel, "maximum parallel burst upload connections (1-8)")
 	flag.BoolVar(&config.insecure, "insecure", false, "disable certificate verification; development only")
@@ -340,6 +340,8 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 		protocolName = "morokss.burst.open.v1"
 	} else if config.network == networkBurstUpload {
 		protocolName = "morokss.burst.upload.v1"
+	} else if config.network == networkBurstDownload {
+		protocolName = "morokss.burst.download.v1"
 	}
 	hostHeader := tlsName
 	request := strings.Join([]string{
@@ -391,7 +393,7 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 		stream.close()
 		return nil, atStage(stageAuth, fmt.Errorf("send authentication: %w", err))
 	}
-	if (config.network == networkUDP || config.network == networkBurstOpen || config.network == networkBurstUpload) && selectedProtocol != protocolName {
+	if (config.network == networkUDP || config.network == networkBurstOpen || config.network == networkBurstUpload || config.network == networkBurstDownload) && selectedProtocol != protocolName {
 		stream.close()
 		return nil, atStage(stageAuth, fmt.Errorf("server does not support MorokSS network mode %q", config.network))
 	}

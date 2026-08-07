@@ -13,6 +13,7 @@ from morokss.server import (
     BurstSessionRegistry,
     acquire_authenticated_burst,
     burst_session_key,
+    run_burst_download,
     run_burst_open,
     run_burst_upload,
 )
@@ -64,6 +65,20 @@ class BlockingReader:
 class EOFReader:
     async def read(self, _size: int) -> bytes:
         return b""
+
+
+class ChunkReader:
+    def __init__(self, *chunks: bytes) -> None:
+        self.chunks = deque(chunks)
+
+    async def read(self, size: int) -> bytes:
+        if not self.chunks:
+            return b""
+        chunk = self.chunks.popleft()
+        if len(chunk) <= size:
+            return chunk
+        self.chunks.appendleft(chunk[size:])
+        return chunk[:size]
 
 
 class HTTPPhysicalReader:
@@ -211,6 +226,25 @@ class BurstSessionTests(unittest.IsolatedAsyncioTestCase):
         await session.submit(2, b"after", False)
         with self.assertRaises(ProtocolError):
             await session.submit(1, b"final", True)
+
+    async def test_download_chunks_are_retry_safe_and_finish_in_order(self) -> None:
+        session = BurstSession(ChunkReader(b"reply"), FakeWriter())
+        self.assertEqual(
+            ("written", 1, b"reply", False), await session.read_download(0, 8192)
+        )
+        self.assertEqual(
+            ("duplicate", 1, b"reply", False), await session.read_download(0, 8192)
+        )
+        self.assertEqual(
+            ("written", 2, b"", True), await session.read_download(1, 8192)
+        )
+        self.assertTrue(session.download_finished)
+        self.assertTrue(session.download_finished_event.is_set())
+        self.assertEqual(
+            ("duplicate", 2, b"", True), await session.read_download(1, 8192)
+        )
+        with self.assertRaises(ProtocolError):
+            await session.read_download(2, 8192)
 
 
 class BurstRegistryTests(unittest.IsolatedAsyncioTestCase):
@@ -410,6 +444,35 @@ class BurstFlowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ProtocolError):
             await run_burst_upload(oversized, self.registry, SECRET)
 
+    async def test_download_returns_hashed_data_and_duplicate(self) -> None:
+        session = await self.registry.get(self.key)
+        session.backend_reader = ChunkReader(b"reply")
+        tunnel = FakeTunnel(
+            burst_json(
+                version=1,
+                session_id=SESSION_ID,
+                sequence=0,
+                max_length=8192,
+            )
+        )
+        await run_burst_download(tunnel, self.registry, SECRET)
+        ack = decode_burst_json(tunnel.sent[0])
+        self.assertEqual("written", ack["status"])
+        self.assertEqual(5, ack["length"])
+        self.assertEqual(b"reply", unpack_envelope(tunnel.sent[1]))
+
+        retry = FakeTunnel(
+            burst_json(
+                version=1,
+                session_id=SESSION_ID,
+                sequence=0,
+                max_length=8192,
+            )
+        )
+        await run_burst_download(retry, self.registry, SECRET)
+        self.assertEqual("duplicate", decode_burst_json(retry.sent[0])["status"])
+        self.assertEqual(b"reply", unpack_envelope(retry.sent[1]))
+
     async def test_open_acknowledges_then_cleans_up_when_control_dies(self) -> None:
         # Use a separate registry because asyncSetUp already occupies this key.
         registry = BurstSessionRegistry()
@@ -431,7 +494,7 @@ class BurstFlowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ProtocolError):
             await registry.get(burst_session_key(SECRET, "a" * 32))
 
-    async def test_backend_eof_sends_fin_but_waits_for_upload_fin(self) -> None:
+    async def test_download_poll_observes_eof_and_control_waits_for_upload_fin(self) -> None:
         registry = BurstSessionRegistry()
         writer = FakeWriter()
         session_id = "b" * 32
@@ -449,15 +512,18 @@ class BurstFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             for _ in range(20):
-                if len(tunnel.sent) >= 2:
+                if len(tunnel.sent) >= 1:
                     break
                 await asyncio.sleep(0)
 
             self.assertEqual("open", decode_burst_json(tunnel.sent[0])["status"])
-            self.assertEqual(b"", unpack_envelope(tunnel.sent[1]))
             self.assertFalse(control.done())
             session = await registry.get(key)
+            self.assertEqual(
+                ("written", 1, b"", True), await session.read_download(0, 8192)
+            )
             self.assertTrue(session.download_finished)
+            self.assertFalse(control.done())
             await session.submit(0, b"", True)
             await asyncio.wait_for(control, timeout=1)
 

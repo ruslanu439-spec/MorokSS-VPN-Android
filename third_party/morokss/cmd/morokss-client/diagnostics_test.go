@@ -88,7 +88,7 @@ func TestDiagnosticReportIncludesPrivacySafeBurstConfig(t *testing.T) {
 		networkUDP,
 		false,
 	)
-	if !report.BurstUpload.Enabled || report.BurstUpload.ChunkBytes != 8192 || report.BurstUpload.Parallel != 4 {
+	if !report.BurstUpload.Enabled || report.BurstUpload.ChunkBytes != 8192 || report.BurstUpload.DownloadChunkBytes != burstDownloadChunk || report.BurstUpload.Parallel != 4 {
 		t.Fatalf("unexpected diagnostic burst config: %#v", report.BurstUpload)
 	}
 	var encoded bytes.Buffer
@@ -139,7 +139,7 @@ func TestAnalyzePathCharacterization(t *testing.T) {
 	if !result.SevereUpstreamDelay || !result.DirectionalAsymmetry {
 		t.Fatalf("expected severe directional delay: %#v", result)
 	}
-	if result.RecommendedBurst.ChunkBytes != 1024 || result.RecommendedBurst.Parallel != 8 {
+	if result.RecommendedBurst.ChunkBytes != 1024 || result.RecommendedBurst.DownloadChunkBytes != burstDownloadChunk || result.RecommendedBurst.Parallel != 8 {
 		t.Fatalf("unexpected recommendation: %#v", result.RecommendedBurst)
 	}
 }
