@@ -62,16 +62,21 @@ data class MorokssTransport(
             // explicit false remains available for troubleshooting and rollback.
             val burstUpload = options["burst_upload"].orEmpty().ifBlank { "true" }
                     .equals("true", ignoreCase = true)
-            val burstChunk = options["burst_chunk"].orEmpty().ifBlank { "8192" }.toIntOrNull()
+            val requestedBurstChunk = options["burst_chunk"].orEmpty().ifBlank { "1024" }.toIntOrNull()
                     ?: throw IllegalArgumentException("MorokSS: burst_chunk must be an integer")
-            require(burstChunk in 1024..8192) {
+            require(requestedBurstChunk in 1024..8192) {
                 "MorokSS: burst_chunk must be between 1024 and 8192 bytes"
             }
-            val burstParallel = options["burst_parallel"].orEmpty().ifBlank { "4" }.toIntOrNull()
+            val requestedBurstParallel = options["burst_parallel"].orEmpty().ifBlank { "8" }.toIntOrNull()
                     ?: throw IllegalArgumentException("MorokSS: burst_parallel must be an integer")
-            require(burstParallel in 1..8) {
+            require(requestedBurstParallel in 1..8) {
                 "MorokSS: burst_parallel must be between 1 and 8"
             }
+            // The real cellular trace needs more than 11 seconds to deliver 2 KiB.
+            // Clamp imported alpha6/alpha7 values to a smaller physical upload and
+            // use the full bounded worker pool so existing profiles are repaired.
+            val burstChunk = minOf(requestedBurstChunk, 1024)
+            val burstParallel = if (burstUpload) 8 else requestedBurstParallel
             return MorokssTransport(
                     hostname,
                     secret,
@@ -176,6 +181,6 @@ data class MorokssTransport(
             command(nativeLibraryDir, false, profileId, networkScope) + listOf(
                     "--diagnose",
                     "--diagnose-network",
-                    "tcp",
+                    "all",
             )
 }

@@ -16,13 +16,13 @@ import (
 const (
 	minBurstChunk        = 1024
 	maxBurstChunk        = 8192
-	defaultBurstChunk    = 4096
+	defaultBurstChunk    = 1024
 	minBurstParallel     = 1
 	maxBurstParallel     = 8
-	defaultBurstParallel = 2
+	defaultBurstParallel = 8
 	burstUploadAttempts  = 3
-	burstAttemptTimeout  = 25 * time.Second
-	burstResponseTimeout = 15 * time.Second
+	burstAttemptTimeout  = 75 * time.Second
+	burstResponseTimeout = 65 * time.Second
 	burstCoalesceDelay   = 15 * time.Millisecond
 )
 

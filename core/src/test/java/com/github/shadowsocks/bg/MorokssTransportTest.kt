@@ -26,8 +26,8 @@ class MorokssTransportTest {
         assertEquals("auto", transport.wireTransport)
         assertEquals("auto", transport.coverSniMode)
         assertTrue(transport.burstUpload)
-        assertEquals(8192, transport.burstChunk)
-        assertEquals(4, transport.burstParallel)
+        assertEquals(1024, transport.burstChunk)
+        assertEquals(8, transport.burstParallel)
         assertTrue(transport.insecure)
         assertEquals(listOf("one.example.com", "two.example.com"), transport.coverSnis)
         assertEquals(listOf(
@@ -40,7 +40,7 @@ class MorokssTransportTest {
     }
 
     @Test
-    fun parsesBurstUploadSettings() {
+    fun clampsLegacyBurstUploadSettingsForSevereDelay() {
         val options = PluginOptions(MorokssPlugin.ID, null).apply {
             put("hostname", "vpn.example.com")
             put("secret", "0123456789abcdef0123456789abcdef")
@@ -52,8 +52,8 @@ class MorokssTransportTest {
         val transport = MorokssTransport.from(Profile(plugin = options.toString(false)))!!
 
         assertTrue(transport.burstUpload)
-        assertEquals(4096, transport.burstChunk)
-        assertEquals(2, transport.burstParallel)
+        assertEquals(1024, transport.burstChunk)
+        assertEquals(8, transport.burstParallel)
     }
 
     @Test

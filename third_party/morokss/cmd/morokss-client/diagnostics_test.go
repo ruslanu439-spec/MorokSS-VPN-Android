@@ -123,3 +123,23 @@ func TestClassifyFlowLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestAnalyzePathCharacterization(t *testing.T) {
+	trials := []clampTrial{
+		{Status: "complete", UploadBytes: 512, DurationMS: 6000, ServerDurationMS: 5500},
+		{Status: "complete", UploadBytes: 1024, DurationMS: 9000, ServerDurationMS: 8000},
+		{Status: "failed", UploadBytes: 2048, DurationMS: 25000},
+	}
+	upload := clampDirectionResult{FreshComplete: 0, FreshPlanned: 8}
+	download := clampDirectionResult{FreshComplete: 8, FreshPlanned: 8}
+	result := analyzePathCharacterization(trials, upload, download)
+	if result.Status != "complete" || result.MaxSuccessfulUploadBytes != 1024 || result.MinFailedUploadBytes != 2048 {
+		t.Fatalf("unexpected characterization: %#v", result)
+	}
+	if !result.SevereUpstreamDelay || !result.DirectionalAsymmetry {
+		t.Fatalf("expected severe directional delay: %#v", result)
+	}
+	if result.RecommendedBurst.ChunkBytes != 1024 || result.RecommendedBurst.Parallel != 8 {
+		t.Fatalf("unexpected recommendation: %#v", result.RecommendedBurst)
+	}
+}

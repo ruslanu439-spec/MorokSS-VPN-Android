@@ -46,6 +46,8 @@ BURST_COMPLETED_WINDOW = 128
 BURST_CONNECTIONS_PER_MINUTE = 2_400
 BURST_ACTIVE_CONNECTIONS_PER_SECRET = 64
 BURST_IO_TIMEOUT = 15.0
+BURST_HEADER_TIMEOUT = 30.0
+BURST_PAYLOAD_TIMEOUT = 60.0
 
 
 @dataclass
@@ -348,7 +350,7 @@ async def _receive_burst_json(
     tunnel: WebSocketStream | HTTPChunkStream,
 ) -> dict[str, object]:
     payload = unpack_envelope(
-        await asyncio.wait_for(tunnel.receive_binary(), timeout=8.0)
+        await asyncio.wait_for(tunnel.receive_binary(), timeout=BURST_HEADER_TIMEOUT)
     )
     try:
         document = json.loads(payload.decode("utf-8"))
@@ -492,7 +494,9 @@ async def run_burst_upload(
         data = b""
         if length:
             data = unpack_envelope(
-                await asyncio.wait_for(tunnel.receive_binary(), timeout=8.0)
+                await asyncio.wait_for(
+                    tunnel.receive_binary(), timeout=BURST_PAYLOAD_TIMEOUT
+                )
             )
             if len(data) != length:
                 raise ProtocolError("burst upload length mismatch")

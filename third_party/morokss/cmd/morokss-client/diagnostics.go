@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	clientVersion = "0.4.0-alpha6"
+	clientVersion = "0.4.0-alpha8"
 	diagnosticAll = "all"
 )
 
@@ -102,12 +102,30 @@ type clampDirectionResult struct {
 }
 
 type flowLimitDiagnostic struct {
-	Status         string                `json:"status"`
-	Classification string                `json:"classification"`
-	Selected       *diagnosticSelection  `json:"selected,omitempty"`
-	Baseline       clampTrial            `json:"baseline"`
-	Upload         *clampDirectionResult `json:"upload,omitempty"`
-	Download       *clampDirectionResult `json:"download,omitempty"`
+	Status               string                `json:"status"`
+	Classification       string                `json:"classification"`
+	Selected             *diagnosticSelection  `json:"selected,omitempty"`
+	Baseline             clampTrial            `json:"baseline"`
+	Upload               *clampDirectionResult `json:"upload,omitempty"`
+	Download             *clampDirectionResult `json:"download,omitempty"`
+	PathCharacterization *pathCharacterization `json:"path_characterization,omitempty"`
+}
+
+type pathCharacterization struct {
+	Status                   string                `json:"status"`
+	UploadLadder             []clampTrial          `json:"upload_ladder"`
+	MaxSuccessfulUploadBytes int                   `json:"max_successful_upload_bytes"`
+	MinFailedUploadBytes     int                   `json:"min_failed_upload_bytes,omitempty"`
+	EstimatedUploadBPS       int64                 `json:"estimated_upload_bytes_per_second,omitempty"`
+	SevereUpstreamDelay      bool                  `json:"severe_upstream_delay"`
+	DirectionalAsymmetry     bool                  `json:"directional_asymmetry"`
+	RecommendedBurst         diagnosticBurstConfig `json:"recommended_burst"`
+	Observations             []string              `json:"observations"`
+}
+
+type uploadLadderStep struct {
+	bytes   int
+	timeout time.Duration
 }
 
 type clampTarget struct {
@@ -182,7 +200,7 @@ func supportedDiagnosticNetwork(value string) bool {
 
 func runDiagnostics(ctx context.Context, config clientConfig, tcpPool, udpPool *endpointPool, network string, includeEndpoints bool) (diagnosticReport, bool) {
 	report := diagnosticReport{
-		SchemaVersion: 2,
+		SchemaVersion: 3,
 		ClientVersion: clientVersion,
 		GeneratedAt:   time.Now().UTC(),
 		BurstUpload: diagnosticBurstConfig{
@@ -239,6 +257,86 @@ func runFlowLimitDiagnostic(ctx context.Context, config clientConfig, pool *endp
 	result.Upload = runClampDirection(ctx, config, target, true)
 	result.Download = runClampDirection(ctx, config, target, false)
 	result.Classification = classifyFlowLimit(*result.Upload, *result.Download)
+	characterization := runPathCharacterization(ctx, config, target, *result.Upload, *result.Download)
+	result.PathCharacterization = &characterization
+	return result
+}
+
+func runPathCharacterization(
+	ctx context.Context,
+	config clientConfig,
+	target clampTarget,
+	upload clampDirectionResult,
+	download clampDirectionResult,
+) pathCharacterization {
+	steps := []uploadLadderStep{
+		{bytes: 512, timeout: 20 * time.Second},
+		{bytes: 1024, timeout: 20 * time.Second},
+		{bytes: 2048, timeout: 25 * time.Second},
+		{bytes: 4096, timeout: 35 * time.Second},
+		{bytes: 8192, timeout: 55 * time.Second},
+	}
+	trials := make([]clampTrial, 0, len(steps)+1)
+	for _, step := range steps {
+		if ctx.Err() != nil {
+			break
+		}
+		trials = append(trials, runClampTrial(ctx, config, target, step.bytes, 0, step.timeout))
+	}
+	// Reuse the already measured 12 KiB fresh-flow result instead of adding
+	// another long trial to an intentionally comprehensive mobile diagnostic.
+	if len(upload.FreshFlows) > 0 {
+		trials = append(trials, upload.FreshFlows[0])
+	}
+	return analyzePathCharacterization(trials, upload, download)
+}
+
+func analyzePathCharacterization(
+	trials []clampTrial,
+	upload clampDirectionResult,
+	download clampDirectionResult,
+) pathCharacterization {
+	result := pathCharacterization{
+		Status:       "complete",
+		UploadLadder: trials,
+		RecommendedBurst: diagnosticBurstConfig{
+			Enabled: true, ChunkBytes: 1024, Parallel: 8,
+		},
+		Observations: make([]string, 0, 4),
+	}
+	var throughputTrial *clampTrial
+	for index := range trials {
+		trial := &trials[index]
+		if trial.Status == "complete" {
+			if trial.UploadBytes > result.MaxSuccessfulUploadBytes {
+				result.MaxSuccessfulUploadBytes = trial.UploadBytes
+				throughputTrial = trial
+			}
+			if trial.ServerDurationMS >= 5000 || trial.DurationMS >= 10000 {
+				result.SevereUpstreamDelay = true
+			}
+		} else if result.MinFailedUploadBytes == 0 || trial.UploadBytes < result.MinFailedUploadBytes {
+			result.MinFailedUploadBytes = trial.UploadBytes
+		}
+	}
+	if throughputTrial != nil && throughputTrial.ServerDurationMS > 0 {
+		result.EstimatedUploadBPS = int64(throughputTrial.UploadBytes) * 1000 / throughputTrial.ServerDurationMS
+	}
+	result.DirectionalAsymmetry = upload.FreshComplete < upload.FreshPlanned/2 &&
+		download.FreshComplete >= download.FreshPlanned/2
+	if result.SevereUpstreamDelay {
+		result.Observations = append(result.Observations, "severe_upstream_delay")
+	}
+	if result.DirectionalAsymmetry {
+		result.Observations = append(result.Observations, "upload_slower_or_less_reliable_than_download")
+	}
+	if result.MinFailedUploadBytes > 0 {
+		result.Observations = append(result.Observations, "fresh_upload_size_boundary_observed")
+	}
+	if result.MaxSuccessfulUploadBytes == 0 {
+		result.Status = "failed"
+		result.Observations = append(result.Observations, "no_upload_ladder_step_completed")
+	}
 	return result
 }
 

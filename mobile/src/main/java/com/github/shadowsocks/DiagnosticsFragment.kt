@@ -121,7 +121,7 @@ class DiagnosticsFragment : ToolbarFragment() {
             coroutineScope {
                 val stdout = async(Dispatchers.IO) { process.inputStream.bufferedReader().readText() }
                 val stderr = async(Dispatchers.IO) { process.errorStream.bufferedReader().readText() }
-                val exitCode = withTimeout(TimeUnit.MINUTES.toMillis(5)) {
+                val exitCode = withTimeout(TimeUnit.MINUTES.toMillis(10)) {
                     while (true) {
                         try {
                             return@withTimeout process.exitValue()

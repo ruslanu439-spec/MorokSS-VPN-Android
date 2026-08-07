@@ -106,8 +106,8 @@ func TestBurstEnvelopeUsesBoundedPadding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(payload) != 8192 {
-		t.Fatalf("default burst envelope is %d bytes, want 8192", len(payload))
+	if len(payload) != 2048 {
+		t.Fatalf("default burst envelope is %d bytes, want 2048", len(payload))
 	}
 	unpacked, err := unpackEnvelope(payload)
 	if err != nil || !bytes.Equal(unpacked, data) {
