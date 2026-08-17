@@ -19,6 +19,7 @@ data class MorokssTransport(
         val manifestSources: List<String>,
         val manifestPublicKey: String,
         val insecure: Boolean,
+        val udpRelay: Boolean,
         val burstUpload: Boolean,
         val burstChunk: Int,
         val burstParallel: Int,
@@ -57,10 +58,20 @@ data class MorokssTransport(
             require(manifestSources.isEmpty() == manifestPublicKey.isEmpty()) {
                 "MorokSS: endpoint_manifest and manifest_public_key must be set together"
             }
-            // Existing MorokSS profiles predate Burst and therefore have no option at all.
-            // Enable it by default so an app update also fixes those saved profiles; an
-            // explicit false remains available for troubleshooting and rollback.
-            val burstUpload = options["burst_upload"].orEmpty().ifBlank { "true" }
+            val trafficMode = options["traffic_mode"].orEmpty().ifBlank { "stream" }.lowercase()
+            require(trafficMode == "stream" || trafficMode == "burst") {
+                "MorokSS: traffic_mode must be stream or burst"
+            }
+            // Burst used many fresh TLS connections. The real cellular trace showed that
+            // sequential 96 KiB flows work while parallel opens are throttled, so legacy
+            // burst_upload=true is no longer enough to opt in. This repairs saved alpha12
+            // profiles automatically; burst remains available with traffic_mode=burst.
+            val burstUpload = trafficMode == "burst" &&
+                    options["burst_upload"].orEmpty().ifBlank { "true" }
+                            .equals("true", ignoreCase = true)
+            // QUIC fan-out created hundreds of permanent UDP tunnels before any useful
+            // TCP data moved. Default to TCP fallback; DNS still uses the local DNS gateway.
+            val udpRelay = options["udp_relay"].orEmpty().ifBlank { "false" }
                     .equals("true", ignoreCase = true)
             val requestedBurstChunk = options["burst_chunk"].orEmpty().ifBlank { "1024" }.toIntOrNull()
                     ?: throw IllegalArgumentException("MorokSS: burst_chunk must be an integer")
@@ -72,11 +83,10 @@ data class MorokssTransport(
             require(requestedBurstParallel in 1..8) {
                 "MorokSS: burst_parallel must be between 1 and 8"
             }
-            // The real cellular trace needs more than 11 seconds to deliver 2 KiB.
-            // Clamp imported alpha6/alpha7 values to a smaller physical upload and
-            // use the full bounded worker pool so existing profiles are repaired.
+            // Keep physical chunks small and avoid the parallel TLS-open pattern that
+            // the real cellular trace throttled after the first two connections.
             val burstChunk = minOf(requestedBurstChunk, 1024)
-            val burstParallel = if (burstUpload) 8 else requestedBurstParallel
+            val burstParallel = if (burstUpload) minOf(requestedBurstParallel, 2) else requestedBurstParallel
             return MorokssTransport(
                     hostname,
                     secret,
@@ -88,6 +98,7 @@ data class MorokssTransport(
                     manifestSources,
                     manifestPublicKey,
                     options["insecure"].equals("true", ignoreCase = true) && BuildConfig.DEBUG,
+                    udpRelay,
                     burstUpload,
                     burstChunk,
                     burstParallel,
@@ -121,8 +132,14 @@ data class MorokssTransport(
         add(File(nativeLibraryDir, Executable.MOROKSS).absolutePath)
         add("--listen")
         add("127.0.0.1:$localPort")
-        add("--udp-listen")
-        add("127.0.0.1:$localPort")
+        if (udpRelay) {
+            add("--udp-listen")
+            add("127.0.0.1:$localPort")
+            add("--udp-max-associations")
+            add("16")
+        }
+        add("--tunnel-open-parallel")
+        add("2")
         add("--profile")
         add(tlsProfile)
         add("--transport")

@@ -37,6 +37,7 @@ type clientConfig struct {
 	network             string
 	udpListen           string
 	udpIdleTimeout      time.Duration
+	udpMaxAssociations  int
 	secret              []byte
 	insecure            bool
 	endpointIndex       int
@@ -51,6 +52,8 @@ type clientConfig struct {
 	burstParallel       int
 	burstSlots          chan struct{}
 	burstDownloadSlots  chan struct{}
+	tunnelOpenParallel  int
+	tunnelOpenSlots     chan struct{}
 	runtimeLog          string
 	runtimeTrace        *runtimeTrace
 	runtimeConnectionID uint64
@@ -83,6 +86,8 @@ func main() {
 	flag.StringVar(&config.networkScope, "network-scope", "default", "cache scope such as cellular or wifi")
 	flag.StringVar(&config.udpListen, "udp-listen", "", "optional local UDP listen address, usually the same address as --listen")
 	flag.DurationVar(&config.udpIdleTimeout, "udp-idle-timeout", 2*time.Minute, "idle timeout for a local UDP association")
+	flag.IntVar(&config.udpMaxAssociations, "udp-max-associations", 16, "maximum active UDP associations (1-256)")
+	flag.IntVar(&config.tunnelOpenParallel, "tunnel-open-parallel", 2, "maximum simultaneous TCP/TLS tunnel handshakes (1-8)")
 	flag.BoolVar(&diagnose, "diagnose", false, "test tunnel readiness and print a privacy-safe JSON report instead of starting local listeners")
 	flag.StringVar(&diagnoseNetwork, "diagnose-network", networkTCP, "network to test with --diagnose: tcp, udp, or all")
 	flag.BoolVar(&diagnoseIncludeEndpoints, "diagnose-include-endpoints", false, "include endpoint addresses and TLS hostnames in the diagnostic report")
@@ -158,6 +163,13 @@ func main() {
 	if config.udpListen != "" && config.udpIdleTimeout <= 0 {
 		log.Fatal("--udp-idle-timeout must be positive")
 	}
+	if config.udpMaxAssociations < 1 || config.udpMaxAssociations > 256 {
+		log.Fatal("--udp-max-associations must be between 1 and 256")
+	}
+	if config.tunnelOpenParallel < 1 || config.tunnelOpenParallel > 8 {
+		log.Fatal("--tunnel-open-parallel must be between 1 and 8")
+	}
+	config.tunnelOpenSlots = make(chan struct{}, config.tunnelOpenParallel)
 	if err := validateBurstConfig(config); err != nil {
 		log.Fatal(err)
 	}
@@ -301,6 +313,10 @@ func openTunnelWith(ctx context.Context, config clientConfig, selector *profileS
 }
 
 func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName string) (tunnelStream, error) {
+	if err := acquireTunnelOpenSlot(ctx, config.tunnelOpenSlots); err != nil {
+		return nil, atStage(stageTCP, fmt.Errorf("wait for tunnel handshake slot: %w", err))
+	}
+	defer releaseTunnelOpenSlot(config.tunnelOpenSlots)
 	dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	configureDialerProtection(&dialer, config.protectPath)
 	raw, err := dialer.DialContext(ctx, "tcp", config.server)
@@ -441,6 +457,24 @@ func openTunnelWithProfile(ctx context.Context, config clientConfig, profileName
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
 	return stream, nil
+}
+
+func acquireTunnelOpenSlot(ctx context.Context, slots chan struct{}) error {
+	if slots == nil {
+		return nil
+	}
+	select {
+	case slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseTunnelOpenSlot(slots chan struct{}) {
+	if slots != nil {
+		<-slots
+	}
 }
 
 func verifyConnectionHostname(state utls.ConnectionState, hostname string) error {

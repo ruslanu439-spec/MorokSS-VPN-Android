@@ -40,42 +40,46 @@ type runtimeFlowStats struct {
 }
 
 type runtimeEvent struct {
-	SchemaVersion    int    `json:"schema_version,omitempty"`
-	Timestamp        string `json:"timestamp"`
-	ElapsedMS        int64  `json:"elapsed_ms"`
-	Event            string `json:"event"`
-	ClientVersion    string `json:"client_version,omitempty"`
-	NetworkScope     string `json:"network_scope,omitempty"`
-	Network          string `json:"network,omitempty"`
-	ConnectionID     uint64 `json:"connection_id,omitempty"`
-	SessionRef       string `json:"session_ref,omitempty"`
-	EndpointIndex    int    `json:"endpoint_index,omitempty"`
-	TLSProfile       string `json:"tls_profile,omitempty"`
-	Transport        string `json:"transport,omitempty"`
-	Direction        string `json:"direction,omitempty"`
-	Sequence         uint64 `json:"sequence,omitempty"`
-	Attempt          int    `json:"attempt,omitempty"`
-	Bytes            int    `json:"bytes,omitempty"`
-	Status           string `json:"status,omitempty"`
-	Stage            string `json:"stage,omitempty"`
-	ErrorCode        string `json:"error_code,omitempty"`
-	DurationMS       int64  `json:"duration_ms,omitempty"`
-	SlotWaitMS       int64  `json:"slot_wait_ms,omitempty"`
-	GlobalActive     int    `json:"global_active,omitempty"`
-	GlobalLimit      int    `json:"global_limit,omitempty"`
-	DownloadActive   int    `json:"download_active,omitempty"`
-	DownloadLimit    int    `json:"download_limit,omitempty"`
-	UploadBytes      int64  `json:"upload_bytes,omitempty"`
-	DownloadBytes    int64  `json:"download_bytes,omitempty"`
-	UploadAttempts   int    `json:"upload_attempts,omitempty"`
-	DownloadAttempts int    `json:"download_attempts,omitempty"`
-	Retries          int    `json:"retries,omitempty"`
-	MaxSlotWaitMS    int64  `json:"max_slot_wait_ms,omitempty"`
-	DroppedEvents    int    `json:"dropped_events,omitempty"`
-	BurstEnabled     bool   `json:"burst_enabled,omitempty"`
-	BurstChunk       int    `json:"burst_chunk,omitempty"`
-	BurstParallel    int    `json:"burst_parallel,omitempty"`
-	DownloadParallel int    `json:"download_parallel,omitempty"`
+	SchemaVersion      int    `json:"schema_version,omitempty"`
+	Timestamp          string `json:"timestamp"`
+	ElapsedMS          int64  `json:"elapsed_ms"`
+	Event              string `json:"event"`
+	ClientVersion      string `json:"client_version,omitempty"`
+	NetworkScope       string `json:"network_scope,omitempty"`
+	Network            string `json:"network,omitempty"`
+	ConnectionID       uint64 `json:"connection_id,omitempty"`
+	SessionRef         string `json:"session_ref,omitempty"`
+	EndpointIndex      int    `json:"endpoint_index,omitempty"`
+	TLSProfile         string `json:"tls_profile,omitempty"`
+	Transport          string `json:"transport,omitempty"`
+	Direction          string `json:"direction,omitempty"`
+	Sequence           uint64 `json:"sequence,omitempty"`
+	Attempt            int    `json:"attempt,omitempty"`
+	Bytes              int    `json:"bytes,omitempty"`
+	Status             string `json:"status,omitempty"`
+	Stage              string `json:"stage,omitempty"`
+	ErrorCode          string `json:"error_code,omitempty"`
+	DurationMS         int64  `json:"duration_ms,omitempty"`
+	SlotWaitMS         int64  `json:"slot_wait_ms,omitempty"`
+	GlobalActive       int    `json:"global_active,omitempty"`
+	GlobalLimit        int    `json:"global_limit,omitempty"`
+	DownloadActive     int    `json:"download_active,omitempty"`
+	DownloadLimit      int    `json:"download_limit,omitempty"`
+	UploadBytes        int64  `json:"upload_bytes,omitempty"`
+	DownloadBytes      int64  `json:"download_bytes,omitempty"`
+	UploadAttempts     int    `json:"upload_attempts,omitempty"`
+	DownloadAttempts   int    `json:"download_attempts,omitempty"`
+	Retries            int    `json:"retries,omitempty"`
+	MaxSlotWaitMS      int64  `json:"max_slot_wait_ms,omitempty"`
+	DroppedEvents      int    `json:"dropped_events,omitempty"`
+	BurstEnabled       bool   `json:"burst_enabled,omitempty"`
+	BurstChunk         int    `json:"burst_chunk,omitempty"`
+	BurstParallel      int    `json:"burst_parallel,omitempty"`
+	DownloadParallel   int    `json:"download_parallel,omitempty"`
+	TunnelOpenParallel int    `json:"tunnel_open_parallel,omitempty"`
+	UDPRelay           bool   `json:"udp_relay,omitempty"`
+	ActiveAssociations int    `json:"active_associations,omitempty"`
+	AssociationLimit   int    `json:"association_limit,omitempty"`
 }
 
 func openRuntimeTrace(path string, config clientConfig) (*runtimeTrace, error) {
@@ -95,9 +99,20 @@ func openRuntimeTrace(path string, config clientConfig) (*runtimeTrace, error) {
 		Event:         "client_start", ClientVersion: clientVersion,
 		NetworkScope: config.networkScope, BurstEnabled: config.burstUpload,
 		BurstChunk: config.burstChunk, BurstParallel: cap(config.burstSlots),
-		DownloadParallel: cap(config.burstDownloadSlots),
+		DownloadParallel:   cap(config.burstDownloadSlots),
+		TunnelOpenParallel: config.tunnelOpenParallel, UDPRelay: config.udpListen != "",
 	})
 	return trace, nil
+}
+
+func (trace *runtimeTrace) udpDrop(active, limit int) {
+	if trace == nil {
+		return
+	}
+	trace.emit(runtimeEvent{
+		Event: "udp_drop", Network: networkUDP, Status: "association_limit",
+		ActiveAssociations: active, AssociationLimit: limit,
+	})
 }
 
 func (trace *runtimeTrace) close() {

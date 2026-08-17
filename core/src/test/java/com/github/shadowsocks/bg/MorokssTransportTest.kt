@@ -25,7 +25,8 @@ class MorokssTransportTest {
         assertEquals("auto", transport.tlsProfile)
         assertEquals("auto", transport.wireTransport)
         assertEquals("auto", transport.coverSniMode)
-        assertTrue(transport.burstUpload)
+        assertEquals(false, transport.burstUpload)
+        assertEquals(false, transport.udpRelay)
         assertEquals(1024, transport.burstChunk)
         assertEquals(8, transport.burstParallel)
         assertTrue(transport.insecure)
@@ -40,7 +41,7 @@ class MorokssTransportTest {
     }
 
     @Test
-    fun clampsLegacyBurstUploadSettingsForSevereDelay() {
+    fun disablesLegacyBurstWithoutExplicitTrafficMode() {
         val options = PluginOptions(MorokssPlugin.ID, null).apply {
             put("hostname", "vpn.example.com")
             put("secret", "0123456789abcdef0123456789abcdef")
@@ -51,9 +52,9 @@ class MorokssTransportTest {
         }
         val transport = MorokssTransport.from(Profile(plugin = options.toString(false)))!!
 
-        assertTrue(transport.burstUpload)
+        assertEquals(false, transport.burstUpload)
         assertEquals(1024, transport.burstChunk)
-        assertEquals(8, transport.burstParallel)
+        assertEquals(2, transport.burstParallel)
     }
 
     @Test
@@ -67,6 +68,23 @@ class MorokssTransportTest {
         val transport = MorokssTransport.from(Profile(plugin = options.toString(false)))!!
 
         assertEquals(false, transport.burstUpload)
+    }
+
+    @Test
+    fun allowsExplicitBurstTrafficModeAndUdpRelay() {
+        val options = PluginOptions(MorokssPlugin.ID, null).apply {
+            put("hostname", "vpn.example.com")
+            put("secret", "0123456789abcdef0123456789abcdef")
+            put("endpoint", "edge.example.com:443")
+            put("traffic_mode", "burst")
+            put("burst_upload", "true")
+            put("udp_relay", "true")
+        }
+        val transport = MorokssTransport.from(Profile(plugin = options.toString(false)))!!
+
+        assertTrue(transport.burstUpload)
+        assertTrue(transport.udpRelay)
+        assertEquals(2, transport.burstParallel)
     }
 
     @Test

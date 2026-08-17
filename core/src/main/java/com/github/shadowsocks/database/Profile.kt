@@ -200,8 +200,10 @@ data class Profile(
                     }
                     options["profile"] = json.optString("profile", "auto")
                     options["transport"] = json.optString("transport", "auto")
+                    options["traffic_mode"] = json.optString("traffic_mode", "stream")
+                    options["udp_relay"] = json.optBoolean("udp_relay", false).toString()
+                    options["burst_upload"] = json.optBoolean("burst_upload", false).toString()
                     if (json.optBoolean("burst_upload", false)) {
-                        options["burst_upload"] = "true"
                         options["burst_chunk"] = json.optInt("burst_chunk", 4096).toString()
                         options["burst_parallel"] = json.optInt("burst_parallel", 2).toString()
                     }

@@ -139,7 +139,17 @@ func TestAnalyzePathCharacterization(t *testing.T) {
 	if !result.SevereUpstreamDelay || !result.DirectionalAsymmetry {
 		t.Fatalf("expected severe directional delay: %#v", result)
 	}
-	if result.RecommendedBurst.ChunkBytes != 1024 || result.RecommendedBurst.DownloadChunkBytes != burstDownloadChunk || result.RecommendedBurst.Parallel != 8 {
+	if !result.RecommendedBurst.Enabled || result.RecommendedBurst.ChunkBytes != 1024 || result.RecommendedBurst.DownloadChunkBytes != burstDownloadChunk || result.RecommendedBurst.Parallel != 2 {
 		t.Fatalf("unexpected recommendation: %#v", result.RecommendedBurst)
+	}
+}
+
+func TestAnalyzePathCharacterizationDisablesBurstWhenLongFlowsPass(t *testing.T) {
+	complete := clampTrial{Status: "complete"}
+	result := analyzePathCharacterization(nil,
+		clampDirectionResult{LongFlow: complete},
+		clampDirectionResult{LongFlow: complete})
+	if result.RecommendedBurst.Enabled {
+		t.Fatalf("burst should be disabled when both long directions pass: %#v", result.RecommendedBurst)
 	}
 }

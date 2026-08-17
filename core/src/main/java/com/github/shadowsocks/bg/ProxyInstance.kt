@@ -68,6 +68,7 @@ class ProxyInstance(val profile: Profile, private val route: String = profile.ro
     private var configFile: File? = null
     var trafficMonitor: TrafficMonitor? = null
     private val morokss by lazy { MorokssTransport.from(profile) }
+    val udpRelayEnabled: Boolean get() = morokss?.udpRelay ?: true
     val plugin by lazy {
         if (morokss == null) PluginManager.init(PluginConfiguration(profile.plugin ?: "")) else null
     }

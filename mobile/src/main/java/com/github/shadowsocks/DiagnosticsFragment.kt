@@ -224,6 +224,11 @@ class DiagnosticsFragment : ToolbarFragment() {
         var maxSlotWait = 0L
         var maxGlobalActive = 0
         var maxDownloadActive = 0
+        var maxUdpAssociations = 0
+        var udpDrops = 0
+        var tunnelOpenParallel = 0
+        var udpRelay = false
+        var burstEnabled = false
         for (index in 0 until events.length()) {
             val event = events.optJSONObject(index) ?: continue
             val name = event.optString("event", "unknown")
@@ -237,6 +242,13 @@ class DiagnosticsFragment : ToolbarFragment() {
             maxSlotWait = maxOf(maxSlotWait, event.optLong("slot_wait_ms"), event.optLong("max_slot_wait_ms"))
             maxGlobalActive = maxOf(maxGlobalActive, event.optInt("global_active"))
             maxDownloadActive = maxOf(maxDownloadActive, event.optInt("download_active"))
+            maxUdpAssociations = maxOf(maxUdpAssociations, event.optInt("active_associations"))
+            if (name == "udp_drop") udpDrops++
+            if (name == "client_start") {
+                tunnelOpenParallel = event.optInt("tunnel_open_parallel")
+                udpRelay = event.optBoolean("udp_relay")
+                burstEnabled = event.optBoolean("burst_enabled")
+            }
             if (name == "connection_start") startedConnections++
             val status = event.optString("status")
             if (name == "burst_attempt" && status != "failed" && status != "slot_failed") {
@@ -267,6 +279,11 @@ class DiagnosticsFragment : ToolbarFragment() {
             put("max_slot_wait_ms", maxSlotWait)
             put("max_global_active", maxGlobalActive)
             put("max_download_active", maxDownloadActive)
+            put("max_udp_associations", maxUdpAssociations)
+            put("udp_drops", udpDrops)
+            put("tunnel_open_parallel", tunnelOpenParallel)
+            put("udp_relay", udpRelay)
+            put("burst_enabled", burstEnabled)
             put("event_counts", counts(eventCounts))
             put("error_counts", counts(errorCounts))
             put("stage_counts", counts(stageCounts))

@@ -91,6 +91,12 @@ func (manager *udpAssociationManager) deliver(address *net.UDPAddr, data []byte)
 	manager.mu.Lock()
 	association := manager.associations[key]
 	if association == nil {
+		if len(manager.associations) >= manager.config.udpMaxAssociations {
+			active := len(manager.associations)
+			manager.mu.Unlock()
+			manager.config.runtimeTrace.udpDrop(active, manager.config.udpMaxAssociations)
+			return
+		}
 		association = &udpAssociation{
 			address:  address,
 			outbound: make(chan []byte, 64),

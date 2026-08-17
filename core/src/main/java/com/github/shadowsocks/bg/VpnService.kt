@@ -218,7 +218,7 @@ class VpnService : BaseVpnService(), BaseService.Interface {
             cmd += "--netif-ip6addr"
             cmd += PRIVATE_VLAN6_ROUTER
         }
-        cmd += "--enable-udprelay"
+        if (data.udpFallback != null || data.proxy?.udpRelayEnabled != false) cmd += "--enable-udprelay"
         data.processes!!.start(cmd, onRestartCallback = {
             try {
                 sendFd(conn.fileDescriptor)

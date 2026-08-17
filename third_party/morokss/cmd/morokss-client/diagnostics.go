@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	clientVersion = "0.4.0-alpha12"
+	clientVersion = "0.4.0-alpha13"
 	diagnosticAll = "all"
 )
 
@@ -434,12 +434,13 @@ func analyzePathCharacterization(
 		Status:       "complete",
 		UploadLadder: trials,
 		RecommendedBurst: diagnosticBurstConfig{
-			Enabled: true, ChunkBytes: 1024, Parallel: 8, GlobalParallel: true,
-			DownloadParallel:   4,
+			Enabled: false, ChunkBytes: 1024, Parallel: 2, GlobalParallel: true,
+			DownloadParallel:   1,
 			DownloadChunkBytes: burstDownloadChunk,
 		},
 		Observations: make([]string, 0, 4),
 	}
+	result.RecommendedBurst.Enabled = upload.LongFlow.Status != "complete" || download.LongFlow.Status != "complete"
 	var throughputTrial *clampTrial
 	for index := range trials {
 		trial := &trials[index]
