@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	clientVersion = "0.4.0-alpha11"
+	clientVersion = "0.4.0-alpha12"
 	diagnosticAll = "all"
 )
 

@@ -110,7 +110,12 @@ func (manager *udpAssociationManager) deliver(address *net.UDPAddr, data []byte)
 }
 
 func (manager *udpAssociationManager) run(key string, association *udpAssociation) {
+	config := manager.config
+	config.network = networkUDP
+	config.runtimeConnectionID = config.runtimeTrace.startFlow(networkUDP)
+	var finishErr error
 	defer func() {
+		config.runtimeTrace.finishFlow(config.runtimeConnectionID, finishErr)
 		manager.mu.Lock()
 		if manager.associations[key] == association {
 			delete(manager.associations, key)
@@ -118,10 +123,9 @@ func (manager *udpAssociationManager) run(key string, association *udpAssociatio
 		manager.mu.Unlock()
 		close(association.done)
 	}()
-	config := manager.config
-	config.network = networkUDP
 	tunnel, err := openAnyEndpoint(manager.ctx, config, manager.pool)
 	if err != nil {
+		finishErr = err
 		log.Printf("UDP association %s failed: %v", association.address, err)
 		return
 	}
@@ -141,6 +145,7 @@ func (manager *udpAssociationManager) run(key string, association *udpAssociatio
 					errorsChannel <- atStage(stageTraffic, err)
 					return
 				}
+				config.runtimeTrace.addDatagram(config, "upload", len(data))
 				lastActivity.Store(time.Now().UnixNano())
 			case <-association.done:
 				return
@@ -166,6 +171,7 @@ func (manager *udpAssociationManager) run(key string, association *udpAssociatio
 				errorsChannel <- err
 				return
 			}
+			config.runtimeTrace.addDatagram(config, "download", len(data))
 			lastActivity.Store(time.Now().UnixNano())
 		}
 	}()
@@ -178,6 +184,7 @@ func (manager *udpAssociationManager) run(key string, association *udpAssociatio
 	for {
 		select {
 		case err := <-errorsChannel:
+			finishErr = err
 			reportTunnelFailure(tunnel, err)
 			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
 				log.Printf("UDP association %s closed: %v", association.address, err)

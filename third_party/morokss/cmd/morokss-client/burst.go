@@ -227,10 +227,13 @@ func handleBurstLocal(ctx context.Context, local net.Conn, config clientConfig, 
 	if err != nil {
 		return err
 	}
+	sessionStarted := time.Now()
 	if err := openBurstSession(ctx, control, sessionID); err != nil {
+		config.runtimeTrace.sessionEvent(route.config, "burst_session_open", sessionID, sessionStarted, err)
 		reportTunnelFailure(control, err)
 		return err
 	}
+	config.runtimeTrace.sessionEvent(route.config, "burst_session_open", sessionID, sessionStarted, nil)
 
 	connectionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -403,16 +406,31 @@ func downloadBurstChunkWithRetry(ctx context.Context, route burstRoute, sessionI
 		if err := ctx.Err(); err != nil {
 			return burstDownloadResult{}, err
 		}
+		slotStarted := time.Now()
 		if err := acquireBurstSlot(ctx, route.config.burstDownloadSlots); err != nil {
+			route.config.runtimeTrace.burstAttempt(route.config, "download", sessionID, sequence,
+				attempt, 0, time.Since(slotStarted), 0, "slot_failed", err)
 			return burstDownloadResult{}, err
 		}
 		if err := acquireBurstSlot(ctx, route.config.burstSlots); err != nil {
 			releaseBurstSlot(route.config.burstDownloadSlots)
+			route.config.runtimeTrace.burstAttempt(route.config, "download", sessionID, sequence,
+				attempt, 0, time.Since(slotStarted), 0, "slot_failed", err)
 			return burstDownloadResult{}, err
 		}
+		slotWait := time.Since(slotStarted)
+		attemptStarted := time.Now()
 		attemptCtx, cancel := context.WithTimeout(ctx, burstAttemptTimeout)
 		result, err := downloadBurstChunk(attemptCtx, route, sessionID, sequence)
 		cancel()
+		status := "data"
+		if result.idle {
+			status = "idle"
+		} else if result.fin {
+			status = "fin"
+		}
+		route.config.runtimeTrace.burstAttempt(route.config, "download", sessionID, sequence,
+			attempt, len(result.data), slotWait, time.Since(attemptStarted), status, err)
 		releaseBurstSlot(route.config.burstSlots)
 		releaseBurstSlot(route.config.burstDownloadSlots)
 		if err == nil {
@@ -593,12 +611,23 @@ func uploadBurstChunkWithRetry(ctx context.Context, route burstRoute, sessionID 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		slotStarted := time.Now()
 		if err := acquireBurstSlot(ctx, route.config.burstSlots); err != nil {
+			route.config.runtimeTrace.burstAttempt(route.config, "upload", sessionID, sequence,
+				attempt, len(data), time.Since(slotStarted), 0, "slot_failed", err)
 			return err
 		}
+		slotWait := time.Since(slotStarted)
+		attemptStarted := time.Now()
 		attemptCtx, cancel := context.WithTimeout(ctx, burstAttemptTimeout)
 		err := uploadBurstChunk(attemptCtx, route, sessionID, sequence, data, fin)
 		cancel()
+		status := "written"
+		if fin {
+			status = "fin"
+		}
+		route.config.runtimeTrace.burstAttempt(route.config, "upload", sessionID, sequence,
+			attempt, len(data), slotWait, time.Since(attemptStarted), status, err)
 		releaseBurstSlot(route.config.burstSlots)
 		if err == nil {
 			return nil

@@ -172,6 +172,8 @@ data class MorokssTransport(
             add("$it,$hostname")
         }
         if (isVpnService) {
+            add("--runtime-log")
+            add(File(state, "morokss-$profileId-runtime.jsonl").absolutePath)
             add("--protect-path")
             add(File(state, "protect_path").absolutePath)
         }

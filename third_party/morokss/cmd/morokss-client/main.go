@@ -22,35 +22,38 @@ import (
 )
 
 type clientConfig struct {
-	listen             string
-	server             string
-	hostname           string
-	profile            string
-	cachePath          string
-	transport          string
-	transportCachePath string
-	endpointCachePath  string
-	manifestSources    manifestSourceList
-	manifestKeyPath    string
-	manifestCachePath  string
-	protectPath        string
-	network            string
-	udpListen          string
-	udpIdleTimeout     time.Duration
-	secret             []byte
-	insecure           bool
-	endpointIndex      int
-	tlsSNI             string
-	coverMode          string
-	coverSNIs          stringList
-	coverCachePath     string
-	networkScope       string
-	diagnostics        *diagnosticTrace
-	burstUpload        bool
-	burstChunk         int
-	burstParallel      int
-	burstSlots         chan struct{}
-	burstDownloadSlots chan struct{}
+	listen              string
+	server              string
+	hostname            string
+	profile             string
+	cachePath           string
+	transport           string
+	transportCachePath  string
+	endpointCachePath   string
+	manifestSources     manifestSourceList
+	manifestKeyPath     string
+	manifestCachePath   string
+	protectPath         string
+	network             string
+	udpListen           string
+	udpIdleTimeout      time.Duration
+	secret              []byte
+	insecure            bool
+	endpointIndex       int
+	tlsSNI              string
+	coverMode           string
+	coverSNIs           stringList
+	coverCachePath      string
+	networkScope        string
+	diagnostics         *diagnosticTrace
+	burstUpload         bool
+	burstChunk          int
+	burstParallel       int
+	burstSlots          chan struct{}
+	burstDownloadSlots  chan struct{}
+	runtimeLog          string
+	runtimeTrace        *runtimeTrace
+	runtimeConnectionID uint64
 }
 
 var sessionCache = utls.NewLRUClientSessionCache(64)
@@ -86,6 +89,7 @@ func main() {
 	flag.BoolVar(&config.burstUpload, "burst-upload", false, "split TCP traffic across fresh authenticated TLS connections")
 	flag.IntVar(&config.burstChunk, "burst-chunk", defaultBurstChunk, "burst upload payload bytes per connection (1024-8192)")
 	flag.IntVar(&config.burstParallel, "burst-parallel", defaultBurstParallel, "maximum parallel burst upload connections (1-8)")
+	flag.StringVar(&config.runtimeLog, "runtime-log", "", "privacy-safe JSONL log for real tunnel sessions")
 	flag.BoolVar(&config.insecure, "insecure", false, "disable certificate verification; development only")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -168,6 +172,14 @@ func main() {
 	if diagnose && !supportedDiagnosticNetwork(diagnoseNetwork) {
 		log.Fatalf("unsupported --diagnose-network %q", diagnoseNetwork)
 	}
+	if config.runtimeLog != "" && !diagnose {
+		trace, err := openRuntimeTrace(config.runtimeLog, config)
+		if err != nil {
+			log.Printf("cannot open privacy-safe runtime trace: %v", err)
+		} else {
+			config.runtimeTrace = trace
+		}
+	}
 	pool := newEndpointPool(endpoints, config.endpointCachePath, config.profile, config.cachePath, config.transport, config.transportCachePath, networkTCP)
 	pool.configureCovers(config.coverMode, config.coverSNIs, config.coverCachePath, config.networkScope+":"+networkTCP)
 	var udpPool *endpointPool
@@ -187,7 +199,11 @@ func main() {
 		return
 	}
 
-	if err := runClientServices(ctx, config, pool, udpPool); err != nil && !errors.Is(err, context.Canceled) {
+	err := runClientServices(ctx, config, pool, udpPool)
+	if config.runtimeTrace != nil {
+		config.runtimeTrace.close()
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}
 }
@@ -213,7 +229,11 @@ func serve(ctx context.Context, config clientConfig, pool *endpointPool) error {
 			return fmt.Errorf("accept local connection: %w", err)
 		}
 		go func() {
-			if err := handleLocal(ctx, local, config, pool); err != nil && !errors.Is(err, io.EOF) {
+			current := config
+			current.runtimeConnectionID = current.runtimeTrace.startFlow(networkTCP)
+			err := handleLocal(ctx, local, current, pool)
+			current.runtimeTrace.finishFlow(current.runtimeConnectionID, err)
+			if err != nil && !errors.Is(err, io.EOF) {
 				log.Printf("connection failed: %v", err)
 			}
 		}()
@@ -252,7 +272,9 @@ func openTunnelWith(ctx context.Context, config clientConfig, selector *profileS
 		if config.diagnostics != nil {
 			attempt = config.diagnostics.startAttempt(config.endpointIndex, config.server, config.hostname, profile, config.transport)
 		}
+		started := time.Now()
 		tunnel, err := opener(ctx, config, profile)
+		config.runtimeTrace.tunnelAttempt(config, profile, started, err)
 		if config.diagnostics != nil {
 			config.diagnostics.finishAttempt(attempt, err)
 		}
